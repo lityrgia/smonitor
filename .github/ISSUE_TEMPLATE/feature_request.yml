@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused capture, decoding, or GUI improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What investigation becomes easier with this change?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include expected filters, fields, or UI behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Capture overhead and compatibility
+      description: If known, describe the expected hot-path, memory, or Windows-version impact.

@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible GUI, capture, or driver problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach kernel dumps containing secrets or personal data.
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Include edition, build number, and x64/WOW64 status of the monitored process.
+      placeholder: Windows 11 24H2, build 26100, x64 process
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: scall-monitor revision
+      placeholder: Git commit or release tag
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected and actual result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Load swatcher.sys in a fresh VM
+        2. Start smonitor.exe
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Include lost counters, active filters, DebugView output, and a short sanitized export.
+      render: text
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Test environment
+      options:
+        - label: I reproduced this in an isolated VM and removed sensitive data from the report.
+          required: true

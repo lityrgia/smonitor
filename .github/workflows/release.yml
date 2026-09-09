@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Build Windows x64 release
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build GUI and driver
+        shell: pwsh
+        run: ./build-windows.ps1 -Configuration Release
+
+      - name: Create archive
+        shell: pwsh
+        run: |
+          $archive = "scall-monitor-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path dist/smonitor.exe, dist/swatcher.sys -DestinationPath $archive
+          "RELEASE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          "$env:RELEASE_ARCHIVE"
+          --verify-tag
+          --generate-notes
+          --title "scall-monitor ${{ github.ref_name }}"

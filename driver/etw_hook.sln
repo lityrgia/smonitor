@@ -1,0 +1,27 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.34301.259
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "etw_hook", "etw_hook\etw_hook.vcxproj", "{6782D26C-67E7-4A07-BAC0-16E505338328}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Debug|x64.ActiveCfg = Debug|x64
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Debug|x64.Build.0 = Debug|x64
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Debug|x64.Deploy.0 = Debug|x64
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Release|x64.ActiveCfg = Release|x64
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Release|x64.Build.0 = Release|x64
+		{6782D26C-67E7-4A07-BAC0-16E505338328}.Release|x64.Deploy.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {A24098EA-884F-4535-9681-5ADA8FE0F5D5}
+	EndGlobalSection
+EndGlobal
