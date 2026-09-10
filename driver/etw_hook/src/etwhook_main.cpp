@@ -1955,7 +1955,7 @@ static NTSTATUS CompleteIrp(PIRP irp, NTSTATUS status, ULONG_PTR information) {
     return status;
 }
 
-static NTSTATUS DispatchCreateClose(PDEVICE_OBJECT device, PIRP irp) {
+static NTSTATUS DispatchCreateCleanupClose(PDEVICE_OBJECT device, PIRP irp) {
     UNREFERENCED_PARAMETER(device);
     auto stack = IoGetCurrentIrpStackLocation(irp);
     if (stack->MajorFunction == IRP_MJ_CREATE) {
@@ -1968,6 +1968,12 @@ static NTSTATUS DispatchCreateClose(PDEVICE_OBJECT device, PIRP irp) {
         gTail = gHead;
         gDetailTail = gDetailHead;
         KeReleaseSpinLock(&gRingLock, oldIrql);
+    } else if (stack->MajorFunction == IRP_MJ_CLEANUP) {
+        // The GUI owns the only user-mode connection. Stop capture as soon as
+        // its file object is cleaned up, including process termination paths
+        // where the collector thread cannot send a final configuration update.
+        InterlockedExchange(&gCaptureEnabled, 0);
+        InterlockedExchange(&gExcludedPid, 0);
     }
     return CompleteIrp(irp, STATUS_SUCCESS, 0);
 }
@@ -2180,8 +2186,9 @@ static NTSTATUS InitializeMonitorDriver(
         return status;
     }
 
-    driverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
-    driverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
+    driverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateCleanupClose;
+    driverObject->MajorFunction[IRP_MJ_CLEANUP] = DispatchCreateCleanupClose;
+    driverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateCleanupClose;
     driverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
     driverObject->DriverUnload = DriverUnload;
     gDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
