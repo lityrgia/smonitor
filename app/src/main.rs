@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
@@ -32,6 +34,20 @@ struct ProcessRow {
     path: String,
     running: bool,
     icon: Option<egui::TextureHandle>,
+}
+
+struct ProcessSnapshot {
+    pid: u32,
+    parent: u32,
+    name: String,
+    path: String,
+}
+
+enum ProcessUpdate {
+    Rows(Vec<ProcessSnapshot>),
+    Icon(String, egui::ColorImage),
+    DefaultIcon(egui::ColorImage),
+    Complete,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -105,14 +121,18 @@ struct MonitorApp {
     filters_dirty: bool,
     dark_mode: bool,
     default_process_icon: egui::TextureHandle,
+    default_process_icon_loaded: bool,
     processes: Vec<ProcessRow>,
+    process_updates: Option<Receiver<ProcessUpdate>>,
+    process_refresh_pending: bool,
     last_process_refresh: Instant,
 }
 
 impl MonitorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx, true);
-        let memory_probe = System::new_all();
+        let mut memory_probe = System::new();
+        memory_probe.refresh_memory();
         let default_max_events = recommended_event_limit(memory_probe.available_memory());
         let default_process_icon = load_default_process_icon(&cc.egui_ctx);
         let mut app = Self {
@@ -146,10 +166,13 @@ impl MonitorApp {
             filters_dirty: true,
             dark_mode: true,
             default_process_icon,
+            default_process_icon_loaded: false,
             processes: Vec::new(),
+            process_updates: None,
+            process_refresh_pending: false,
             last_process_refresh: Instant::now(),
         };
-        app.refresh_processes(&cc.egui_ctx);
+        app.request_process_refresh();
         app.send_config();
         app
     }
@@ -334,7 +357,69 @@ impl MonitorApp {
         self.filters_dirty = false;
     }
 
-    fn refresh_processes(&mut self, ctx: &egui::Context) {
+    fn request_process_refresh(&mut self) {
+        if self.process_refresh_pending {
+            return;
+        }
+        let cached_paths: HashSet<String> = self
+            .processes
+            .iter()
+            .filter(|process| process.icon.is_some() && !process.path.is_empty())
+            .map(|process| process.path.clone())
+            .collect();
+        let load_default_icon = !self.default_process_icon_loaded;
+        let (updates, receiver) = channel();
+        let spawned = thread::Builder::new()
+            .name("process-scanner".into())
+            .spawn(move || {
+                let system = System::new_all();
+                let rows: Vec<_> = system
+                    .processes()
+                    .iter()
+                    .map(|(pid, process)| ProcessSnapshot {
+                        pid: pid.as_u32(),
+                        parent: process.parent().map_or(0, |parent| parent.as_u32()),
+                        name: process.name().to_string_lossy().into_owned(),
+                        path: process
+                            .exe()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                if updates.send(ProcessUpdate::Rows(rows)).is_err() {
+                    return;
+                }
+                if load_default_icon
+                    && let Some(icon) = process_icon::load_default()
+                    && updates.send(ProcessUpdate::DefaultIcon(icon)).is_err()
+                {
+                    return;
+                }
+                let mut seen = cached_paths;
+                let system = system.processes();
+                for process in system.values() {
+                    let Some(path) = process.exe().map(|path| path.display().to_string()) else {
+                        continue;
+                    };
+                    if path.is_empty() || !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    if let Some(icon) = process_icon::load(&path)
+                        && updates.send(ProcessUpdate::Icon(path, icon)).is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = updates.send(ProcessUpdate::Complete);
+            });
+        if spawned.is_ok() {
+            self.process_updates = Some(receiver);
+            self.process_refresh_pending = true;
+            self.last_process_refresh = Instant::now();
+        }
+    }
+
+    fn replace_process_rows(&mut self, snapshots: Vec<ProcessSnapshot>) {
         let old_processes = self.processes.clone();
         let old_icons: HashMap<String, egui::TextureHandle> = self
             .processes
@@ -346,30 +431,15 @@ impl MonitorApp {
                     .map(|icon| (process.path.clone(), icon))
             })
             .collect();
-        let mut system = System::new_all();
-        system.refresh_all();
-        self.processes = system
-            .processes()
-            .iter()
-            .map(|(pid, process)| {
-                let path = process
-                    .exe()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default();
-                let icon = old_icons.get(&path).cloned().or_else(|| {
-                    process_icon::load(&path).map(|image| {
-                        ctx.load_texture(
-                            format!("process-icon-{}", pid.as_u32()),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        )
-                    })
-                });
+        self.processes = snapshots
+            .into_iter()
+            .map(|process| {
+                let icon = old_icons.get(&process.path).cloned();
                 ProcessRow {
-                    pid: pid.as_u32(),
-                    parent: process.parent().map_or(0, |parent| parent.as_u32()),
-                    name: process.name().to_string_lossy().into_owned(),
-                    path,
+                    pid: process.pid,
+                    parent: process.parent,
+                    name: process.name,
+                    path: process.path,
                     running: true,
                     icon,
                 }
@@ -392,7 +462,48 @@ impl MonitorApp {
                 .to_ascii_lowercase()
                 .cmp(&b.name.to_ascii_lowercase())
         });
-        self.last_process_refresh = Instant::now();
+    }
+
+    fn drain_process_updates(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.process_updates else {
+            return;
+        };
+        let mut updates = Vec::new();
+        let disconnected = loop {
+            match receiver.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        let mut complete = disconnected;
+        for update in updates {
+            match update {
+                ProcessUpdate::Rows(rows) => self.replace_process_rows(rows),
+                ProcessUpdate::Icon(path, image) => {
+                    let texture = ctx.load_texture(
+                        format!("process-icon-{path}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    for process in &mut self.processes {
+                        if process.path == path {
+                            process.icon = Some(texture.clone());
+                        }
+                    }
+                }
+                ProcessUpdate::DefaultIcon(image) => {
+                    self.default_process_icon
+                        .set(image, egui::TextureOptions::LINEAR);
+                    self.default_process_icon_loaded = true;
+                }
+                ProcessUpdate::Complete => complete = true,
+            }
+        }
+        if complete {
+            self.process_updates = None;
+            self.process_refresh_pending = false;
+        }
     }
 
     fn apply_capture_process(&mut self) {
@@ -768,8 +879,14 @@ impl MonitorApp {
 
     fn processes_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Refresh").clicked() {
-                self.refresh_processes(ui.ctx());
+            if ui
+                .add_enabled(!self.process_refresh_pending, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.request_process_refresh();
+            }
+            if self.process_refresh_pending {
+                ui.spinner();
             }
             ui.label("Double-click a process to capture only calls made by it.");
         });
@@ -1005,8 +1122,11 @@ impl MonitorApp {
 impl eframe::App for MonitorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_source();
-        if self.last_process_refresh.elapsed() >= Duration::from_secs(5) {
-            self.refresh_processes(ui.ctx());
+        self.drain_process_updates(ui.ctx());
+        if !self.process_refresh_pending
+            && self.last_process_refresh.elapsed() >= Duration::from_secs(5)
+        {
+            self.request_process_refresh();
         }
         if ui.style().visuals.dark_mode != self.dark_mode {
             apply_theme(ui.ctx(), self.dark_mode);
@@ -1186,15 +1306,7 @@ fn event_process_name<'a>(event: &'a RawEvent, processes: &'a [ProcessRow]) -> &
 }
 
 fn load_default_process_icon(ctx: &egui::Context) -> egui::TextureHandle {
-    let image = process_icon::load_default().unwrap_or_else(|| {
-        let icon =
-            eframe::icon_data::from_png_bytes(include_bytes!("../resources/window-icon.png"))
-                .expect("embedded application icon must be a valid PNG");
-        egui::ColorImage::from_rgba_unmultiplied(
-            [icon.width as usize, icon.height as usize],
-            &icon.rgba,
-        )
-    });
+    let image = egui::ColorImage::filled([20, 20], Color32::from_rgb(105, 110, 118));
     ctx.load_texture("default-process-icon", image, egui::TextureOptions::LINEAR)
 }
 
@@ -1298,6 +1410,7 @@ fn main() -> eframe::Result {
             .with_title("Syscall Monitor")
             .with_inner_size([1180.0, 760.0])
             .with_icon(icon),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
