@@ -39,8 +39,9 @@ decoders. They can show object paths, access masks, sizes, protection flags, tar
 immediate NTSTATUS result. Other calls show their first four raw arguments; their result is displayed
 as `unknown` when no return detour is installed.
 
-`NtUser*` and `NtGdi*` calls are not captured. They enter the separate Win32k service table through
-`win32u.dll`, while this driver currently monitors only the main `ntdll.dll` syscall table.
+Experimental Win32k capture is available for `NtUser*`, `NtGdi*`, and related calls exported by
+`win32u.dll`. Enable the **User** or **Graphics** category together with a process filter; both are
+disabled by default because GUI applications generate a very high event rate.
 
 ## Build
 
@@ -74,7 +75,8 @@ Administrator.
 ## Platform
 
 Windows 10/11 x64. Compatibility must be checked for each Windows build because the capture method
-depends on internal kernel implementation details. WOW64 and Win32k capture are not supported.
+depends on internal kernel implementation details. WOW64 is not supported, and Win32k capture is
+experimental.
 
 ## License
 

@@ -19,7 +19,7 @@ extern "C" NTKERNELAPI PCHAR PsGetProcessImageFileName(PEPROCESS Process);
 
 static_assert((LOG_RING_ENTRIES & (LOG_RING_ENTRIES - 1)) == 0, "ring size must be a power of two");
 static_assert(sizeof(SCALL_EVENT) == 80, "SCALL_EVENT ABI changed");
-static_assert(sizeof(SCALL_CONFIG) == 856, "SCALL_CONFIG ABI changed");
+static_assert(sizeof(SCALL_CONFIG) == 1368, "SCALL_CONFIG ABI changed");
 static_assert(sizeof(SCALL_STATS) == 56, "SCALL_STATS ABI changed");
 static_assert(sizeof(SCALL_DETAIL) == 176, "SCALL_DETAIL ABI changed");
 
@@ -140,6 +140,9 @@ static ULONG gIdxAdjustPrivilegesToken = MAXULONG;
 static ULONG gIdxReleaseMutant = MAXULONG;
 static ULONG gIdxAlpcSendWaitReceivePort = MAXULONG;
 static ULONG gIdxQuerySystemInformation = MAXULONG;
+static ULONG gIdxGdiExtTextOutW = MAXULONG;
+static ULONG gIdxGdiGetTextExtent = MAXULONG;
+static ULONG gIdxGdiGetTextExtentExW = MAXULONG;
 
 static NTSTATUS DetCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
     PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
@@ -212,6 +215,9 @@ static NTSTATUS DetAdjustPrivilegesToken(HANDLE, BOOLEAN, PVOID, ULONG, PVOID, P
 static NTSTATUS DetReleaseMutant(HANDLE, PULONG);
 static NTSTATUS DetAlpcSendWaitReceivePort(HANDLE, ULONG, PVOID, PVOID, PVOID, PSIZE_T, PVOID, PVOID);
 static NTSTATUS DetQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
+static LONG DetGdiExtTextOutW(PVOID, LONG, LONG, ULONG, PVOID, PWCHAR, LONG, PLONG, ULONG);
+static LONG DetGdiGetTextExtent(PVOID, PWCHAR, LONG, PVOID, ULONG);
+static LONG DetGdiGetTextExtentExW(PVOID, PWCHAR, ULONG, ULONG, PULONG, PULONG, PVOID, ULONG);
 
 struct IMPORTANT_DETOUR {
     const char* name;
@@ -280,9 +286,17 @@ static IMPORTANT_DETOUR gImportantDetours[] = {
     { "NtReleaseMutant", &gIdxReleaseMutant, reinterpret_cast<PVOID>(DetReleaseMutant) },
     { "NtAlpcSendWaitReceivePort", &gIdxAlpcSendWaitReceivePort, reinterpret_cast<PVOID>(DetAlpcSendWaitReceivePort) },
     { "NtQuerySystemInformation", &gIdxQuerySystemInformation, reinterpret_cast<PVOID>(DetQuerySystemInformation) },
+    { "NtGdiExtTextOutW", &gIdxGdiExtTextOutW, reinterpret_cast<PVOID>(DetGdiExtTextOutW) },
+    { "NtGdiGetTextExtent", &gIdxGdiGetTextExtent, reinterpret_cast<PVOID>(DetGdiGetTextExtent) },
+    { "NtGdiGetTextExtentExW", &gIdxGdiGetTextExtentExW, reinterpret_cast<PVOID>(DetGdiGetTextExtentExW) },
 };
 
-static USHORT ClassifySyscall(const char* name) {
+static USHORT ClassifySyscall(const char* name, BOOLEAN win32k) {
+    if (win32k) {
+        if (strstr(name, "Gdi") || strstr(name, "DComposition") || strstr(name, "Dxg"))
+            return ScallCategoryGraphics;
+        return ScallCategoryUser;
+    }
     if (strstr(name, "DeviceIoControl") || strstr(name, "FsControl"))
         return ScallCategorySystem;
     if (strstr(name, "File") || strstr(name, "Directory") || strstr(name, "Volume") || strstr(name, "Ea"))
@@ -306,14 +320,15 @@ static USHORT ClassifySyscall(const char* name) {
     return ScallCategoryOther;
 }
 
-static void ParsePeExports(PVOID imageBase) {
+static ULONG ParsePeExports(PVOID imageBase, BOOLEAN win32k) {
+    ULONG parsed = 0;
     __try {
         auto dos = static_cast<PIMAGE_DOS_HEADER>(imageBase);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
         auto nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(static_cast<PUCHAR>(imageBase) + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
         ULONG exportRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        if (!exportRva) return;
+        if (!exportRva) return 0;
         auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(static_cast<PUCHAR>(imageBase) + exportRva);
         auto names = reinterpret_cast<PULONG>(static_cast<PUCHAR>(imageBase) + exports->AddressOfNames);
         auto ordinals = reinterpret_cast<PUSHORT>(static_cast<PUCHAR>(imageBase) + exports->AddressOfNameOrdinals);
@@ -327,7 +342,7 @@ static void ParsePeExports(PVOID imageBase) {
             ULONG id = *reinterpret_cast<PULONG>(function + 4);
             if (id >= SCALL_MAX_SYSCALLS) continue;
             RtlStringCbCopyA(gSyscallTable[id].name, sizeof(gSyscallTable[id].name), name);
-            gSyscallTable[id].category = ClassifySyscall(name);
+            gSyscallTable[id].category = ClassifySyscall(name, win32k);
             for (auto& detour : gImportantDetours) {
                 if (strcmp(name, detour.name) == 0) {
                     *detour.index = id;
@@ -336,16 +351,18 @@ static void ParsePeExports(PVOID imageBase) {
                 }
             }
             if (id >= gSyscallCount) gSyscallCount = id + 1;
+            ++parsed;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        gSyscallCount = 0;
+        parsed = 0;
     }
+    return parsed;
 }
 
-static NTSTATUS BuildSyscallTable() {
+static NTSTATUS LoadSyscallTable(const wchar_t* path, BOOLEAN win32k) {
     UNICODE_STRING dllName;
-    RtlInitUnicodeString(&dllName, L"\\SystemRoot\\System32\\ntdll.dll");
+    RtlInitUnicodeString(&dllName, path);
     OBJECT_ATTRIBUTES attributes;
     InitializeObjectAttributes(&attributes, &dllName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
     IO_STATUS_BLOCK io = {};
@@ -365,9 +382,15 @@ static NTSTATUS BuildSyscallTable() {
         ViewUnmap, 0, PAGE_READONLY);
     ZwClose(section);
     if (!NT_SUCCESS(status)) return status;
-    ParsePeExports(base);
+    ULONG parsed = ParsePeExports(base, win32k);
     ZwUnmapViewOfSection(ZwCurrentProcess(), base);
-    return gSyscallCount ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    return parsed ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static NTSTATUS BuildSyscallTable() {
+    NTSTATUS status = LoadSyscallTable(L"\\SystemRoot\\System32\\ntdll.dll", FALSE);
+    if (!NT_SUCCESS(status)) return status;
+    return LoadSyscallTable(L"\\SystemRoot\\System32\\win32u.dll", TRUE);
 }
 
 static char LowerAscii(char value) {
@@ -559,7 +582,7 @@ static void LogImportant(ULONG syscallId, const char* text) {
     EnqueueDetail(CurrentImportantSequence(), text);
 }
 
-static void LogCurrentResult(NTSTATUS status) {
+static ULONGLONG PopImportantSequence() {
     PETHREAD thread = PsGetCurrentThread();
     KIRQL oldIrql;
     KeAcquireSpinLock(&gResultLock, &oldIrql);
@@ -567,10 +590,18 @@ static void LogCurrentResult(NTSTATUS status) {
     ULONGLONG sequence = slot && slot->depth ? slot->sequences[--slot->depth] : 0;
     if (slot && !slot->depth) slot->thread = reinterpret_cast<PETHREAD>(1);
     KeReleaseSpinLock(&gResultLock, oldIrql);
-    if (!sequence) return;
+    return sequence;
+}
+
+static void LogCurrentOutcome(const char* result) {
+    ULONGLONG sequence = PopImportantSequence();
+    if (sequence) EnqueueDetailKind(sequence, 1, result);
+}
+
+static void LogCurrentResult(NTSTATUS status) {
     char result[32];
     RtlStringCbPrintfA(result, sizeof(result), "0x%08X", static_cast<ULONG>(status));
-    EnqueueDetailKind(sequence, 1, result);
+    LogCurrentOutcome(result);
 }
 
 static void ReadUnicode(PUNICODE_STRING source, char* output, ULONG outputSize) {
@@ -649,6 +680,404 @@ static void ReadObjectPath(POBJECT_ATTRIBUTES attributes, char* output, ULONG ou
     }
 }
 
+struct SCALL_RECT32 {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+};
+
+struct SCALL_TRACK_MOUSE_EVENT {
+    ULONG size;
+    ULONG flags;
+    HANDLE window;
+    ULONG hoverTime;
+};
+
+struct SCALL_POINT32 {
+    LONG x;
+    LONG y;
+};
+
+struct SCALL_WINDOW_PLACEMENT {
+    ULONG length;
+    ULONG flags;
+    ULONG showCommand;
+    SCALL_POINT32 minimumPosition;
+    SCALL_POINT32 maximumPosition;
+    SCALL_RECT32 normalPosition;
+};
+
+struct SCALL_FLASH_WINDOW_INFO {
+    ULONG size;
+    ULONG padding;
+    HANDLE window;
+    ULONG flags;
+    ULONG count;
+    ULONG timeout;
+};
+
+struct SCALL_INPUT_RECORD {
+    ULONG type;
+    ULONG padding;
+    UCHAR data[32];
+};
+
+struct SCALL_LARGE_STRING {
+    ULONG length;
+    ULONG maximumLength;
+    ULONG_PTR buffer;
+};
+
+template<typename T>
+static BOOLEAN ReadUserValue(ULONG_PTR address, T* value) {
+    if (!address || !value || KeGetCurrentIrql() != PASSIVE_LEVEL) return FALSE;
+    __try {
+        ProbeForRead(reinterpret_cast<PVOID>(address), sizeof(T), 1);
+        RtlCopyMemory(value, reinterpret_cast<PVOID>(address), sizeof(T));
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+static void ReadRect(ULONG_PTR address, char* output, ULONG outputSize) {
+    if (!address) {
+        RtlStringCbCopyA(output, outputSize, "all");
+        return;
+    }
+    SCALL_RECT32 rect = {};
+    if (!ReadUserValue(address, &rect)) {
+        RtlStringCbCopyA(output, outputSize, "unavailable");
+        return;
+    }
+    RtlStringCbPrintfA(output, outputSize, "(%ld,%ld)-(%ld,%ld)",
+        rect.left, rect.top, rect.right, rect.bottom);
+}
+
+static void ReadWideText(ULONG_PTR address, ULONG characters, char* output, ULONG outputSize) {
+    output[0] = 0;
+    if (!address || !characters || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    ULONG capped = characters > 96 ? 96 : characters;
+    UNICODE_STRING text = {};
+    text.Buffer = reinterpret_cast<PWCHAR>(address);
+    text.Length = static_cast<USHORT>(capped * sizeof(WCHAR));
+    text.MaximumLength = text.Length;
+    ReadUnicode(&text, output, outputSize);
+}
+
+static void ReadUnicodeArgument(ULONG_PTR address, char* output, ULONG outputSize) {
+    output[0] = 0;
+    if (!address || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    ReadUnicode(reinterpret_cast<PUNICODE_STRING>(address), output, outputSize);
+}
+
+static void ReadLargeString(ULONG_PTR address, char* output, ULONG outputSize) {
+    output[0] = 0;
+    SCALL_LARGE_STRING text = {};
+    if (!ReadUserValue(address, &text) || !text.buffer || !text.length) return;
+    if (text.maximumLength & 0x80000000u) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+        ULONG capped = text.length > outputSize - 1 ? outputSize - 1 : text.length;
+        __try {
+            ProbeForRead(reinterpret_cast<PVOID>(text.buffer), capped, 1);
+            RtlCopyMemory(output, reinterpret_cast<PVOID>(text.buffer), capped);
+            output[capped] = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            RtlStringCbCopyA(output, outputSize, "<unavailable>");
+        }
+        return;
+    }
+    ReadWideText(text.buffer, text.length / sizeof(WCHAR), output, outputSize);
+}
+
+static void DecodeWin32kArguments(ULONGLONG sequence, const char* name,
+    const ULONG_PTR* arguments) {
+    if (!sequence || !name || !arguments) return;
+    ULONG_PTR a1 = arguments[0];
+    ULONG_PTR a2 = arguments[1];
+    ULONG_PTR a3 = arguments[2];
+    ULONG_PTR a4 = arguments[3];
+    char detail[160] = {};
+
+    if (!strcmp(name, "NtUserFindWindowEx")) {
+        char className[44] = {};
+        char windowName[44] = {};
+        ReadUnicodeArgument(a3, className, sizeof(className));
+        ReadUnicodeArgument(a4, windowName, sizeof(windowName));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Parent=0x%llX Child=0x%llX Class=\"%s\" Title=\"%s\"",
+            a1, a2, className, windowName);
+    } else if (!strcmp(name, "NtUserDefSetText")) {
+        char text[104] = {};
+        ReadLargeString(a2, text, sizeof(text));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Text=\"%s\"", a1, text);
+    } else if (!strcmp(name, "NtUserSetWindowPlacement")) {
+        SCALL_WINDOW_PLACEMENT placement = {};
+        if (ReadUserValue(a2, &placement)) {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Hwnd=0x%llX Show=%u Normal=(%ld,%ld)-(%ld,%ld)",
+                a1, placement.showCommand, placement.normalPosition.left,
+                placement.normalPosition.top, placement.normalPosition.right,
+                placement.normalPosition.bottom);
+        } else {
+            RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Placement=0x%llX", a1, a2);
+        }
+    } else if (!strcmp(name, "NtUserFlashWindowEx")) {
+        SCALL_FLASH_WINDOW_INFO flash = {};
+        if (ReadUserValue(a1, &flash)) {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Hwnd=0x%llX Flags=0x%X Count=%u Timeout=%u",
+                reinterpret_cast<ULONG_PTR>(flash.window), flash.flags, flash.count, flash.timeout);
+        } else {
+            RtlStringCbPrintfA(detail, sizeof(detail), "Info=0x%llX", a1);
+        }
+    } else if (!strcmp(name, "NtUserCalculatePopupWindowPosition")) {
+        SCALL_POINT32 anchor = {};
+        SCALL_POINT32 size = {};
+        BOOLEAN haveAnchor = ReadUserValue(a1, &anchor);
+        BOOLEAN haveSize = ReadUserValue(a2, &size);
+        if (haveAnchor && haveSize) {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Anchor=(%ld,%ld) Size=%ldx%ld Flags=0x%X Exclude=0x%llX",
+                anchor.x, anchor.y, size.x, size.y, static_cast<ULONG>(a3), a4);
+        } else {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Anchor=0x%llX Size=0x%llX Flags=0x%X Exclude=0x%llX",
+                a1, a2, static_cast<ULONG>(a3), a4);
+        }
+    } else if (!strcmp(name, "NtUserInvalidateRect")) {
+        char rect[64] = {};
+        ReadRect(a2, rect, sizeof(rect));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Rect=%s Erase=%s",
+            a1, rect, a3 ? "true" : "false");
+    } else if (!strcmp(name, "NtUserValidateRect")) {
+        char rect[64] = {};
+        ReadRect(a2, rect, sizeof(rect));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Rect=%s", a1, rect);
+    } else if (!strcmp(name, "NtUserRedrawWindow")) {
+        char rect[64] = {};
+        ReadRect(a2, rect, sizeof(rect));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Rect=%s Region=0x%llX Flags=0x%llX", a1, rect, a3, a4);
+    } else if (!strcmp(name, "NtUserDrawAnimatedRects")) {
+        char from[48] = {};
+        char to[48] = {};
+        ReadRect(a3, from, sizeof(from));
+        ReadRect(a4, to, sizeof(to));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Animation=%llu From=%s To=%s", a1, a2, from, to);
+    } else if (!strcmp(name, "NtUserClipCursor")) {
+        char rect[64] = {};
+        ReadRect(a1, rect, sizeof(rect));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Rect=%s", rect);
+    } else if (!strcmp(name, "NtUserTrackMouseEvent")) {
+        SCALL_TRACK_MOUSE_EVENT event = {};
+        if (ReadUserValue(a1, &event)) {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Hwnd=0x%llX Flags=0x%X HoverTime=%u",
+                reinterpret_cast<ULONG_PTR>(event.window), event.flags, event.hoverTime);
+        } else {
+            RtlStringCbPrintfA(detail, sizeof(detail), "Event=0x%llX", a1);
+        }
+    } else if (!strcmp(name, "NtUserPostMessage") ||
+        !strcmp(name, "NtUserMessageCall")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Message=0x%X WParam=0x%llX LParam=0x%llX",
+            a1, static_cast<ULONG>(a2), a3, a4);
+    } else if (!strcmp(name, "NtUserGetMessage") ||
+        !strcmp(name, "NtUserPeekMessage")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Message=0x%llX Hwnd=0x%llX Min=0x%X Max=0x%X",
+            a1, a2, static_cast<ULONG>(a3), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtUserSetWindowPos")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX InsertAfter=0x%llX X=%ld Y=%ld",
+            a1, a2, static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtUserMoveWindow")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX X=%ld Y=%ld Width=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtUserSetCursorPos") ||
+        !strcmp(name, "NtUserSetCaretPos")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "X=%ld Y=%ld",
+            static_cast<LONG>(a1), static_cast<LONG>(a2));
+    } else if (!strcmp(name, "NtUserWindowFromPoint") ||
+        !strcmp(name, "NtUserWindowFromPhysicalPoint")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Point=(%ld,%ld)",
+            static_cast<LONG>(a1), static_cast<LONG>(a1 >> 32));
+    } else if (!strcmp(name, "NtUserChildWindowFromPointEx")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Point=(%ld,%ld) Flags=0x%llX",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a2 >> 32), a3);
+    } else if (!strcmp(name, "NtUserRealChildWindowFromPoint") ||
+        !strcmp(name, "NtUserDragDetect")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Point=(%ld,%ld)",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a2 >> 32));
+    } else if (!strcmp(name, "NtUserRegisterHotKey")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Id=%ld Modifiers=0x%X Key=0x%X",
+            a1, static_cast<LONG>(a2), static_cast<ULONG>(a3), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtUserSetLayeredWindowAttributes")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Color=0x%06X Alpha=%u Flags=0x%X",
+            a1, static_cast<ULONG>(a2) & 0xFFFFFF, static_cast<ULONG>(a3) & 0xFF,
+            static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtUserSetTimer")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Id=0x%llX Elapse=%u Callback=0x%llX",
+            a1, a2, static_cast<ULONG>(a3), a4);
+    } else if (!strcmp(name, "NtUserTrackPopupMenuEx")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Menu=0x%llX Flags=0x%X X=%ld Y=%ld",
+            a1, static_cast<ULONG>(a2), static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtUserSendInput")) {
+        SCALL_INPUT_RECORD input = {};
+        if (ReadUserValue(a2, &input)) {
+            if (input.type == 0) {
+                LONG dx = 0;
+                LONG dy = 0;
+                ULONG mouseData = 0;
+                ULONG flags = 0;
+                RtlCopyMemory(&dx, &input.data[0], sizeof(dx));
+                RtlCopyMemory(&dy, &input.data[4], sizeof(dy));
+                RtlCopyMemory(&mouseData, &input.data[8], sizeof(mouseData));
+                RtlCopyMemory(&flags, &input.data[12], sizeof(flags));
+                RtlStringCbPrintfA(detail, sizeof(detail),
+                    "Count=%u Mouse=(%ld,%ld) Data=0x%X Flags=0x%X",
+                    static_cast<ULONG>(a1), dx, dy, mouseData, flags);
+            } else if (input.type == 1) {
+                USHORT key = 0;
+                USHORT scan = 0;
+                ULONG flags = 0;
+                RtlCopyMemory(&key, &input.data[0], sizeof(key));
+                RtlCopyMemory(&scan, &input.data[2], sizeof(scan));
+                RtlCopyMemory(&flags, &input.data[4], sizeof(flags));
+                RtlStringCbPrintfA(detail, sizeof(detail),
+                    "Count=%u Keyboard Key=0x%X Scan=0x%X Flags=0x%X",
+                    static_cast<ULONG>(a1), key, scan, flags);
+            } else {
+                RtlStringCbPrintfA(detail, sizeof(detail),
+                    "Count=%u Type=%u InputSize=%u",
+                    static_cast<ULONG>(a1), input.type, static_cast<ULONG>(a3));
+            }
+        } else {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "Count=%u Inputs=0x%llX InputSize=%u",
+                static_cast<ULONG>(a1), a2, static_cast<ULONG>(a3));
+        }
+    } else if (!strcmp(name, "NtUserGetDCEx")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX ClipRegion=0x%llX Flags=0x%X",
+            a1, a2, static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtUserPrintWindow")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hwnd=0x%llX Hdc=0x%llX Flags=0x%X", a1, a2, static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtUserAttachThreadInput")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Thread=%u AttachTo=%u Attach=%s",
+            static_cast<ULONG>(a1), static_cast<ULONG>(a2), a3 ? "true" : "false");
+    } else if (!strcmp(name, "NtUserOpenInputDesktop")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Flags=0x%X Inherit=%s Access=0x%X",
+            static_cast<ULONG>(a1), a2 ? "true" : "false", static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtUserSetInformationThread") ||
+        !strcmp(name, "NtUserQueryInformationThread")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Thread=0x%llX Class=%u Buffer=0x%llX Size=%u",
+            a1, static_cast<ULONG>(a2), a3, static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtUserShowWindow") ||
+        !strcmp(name, "NtUserShowWindowAsync")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Command=%ld",
+            a1, static_cast<LONG>(a2));
+    } else if (!strcmp(name, "NtUserSetFocus") ||
+        !strcmp(name, "NtUserSetActiveWindow") || !strcmp(name, "NtUserSetCapture") ||
+        !strcmp(name, "NtUserDestroyWindow") || !strcmp(name, "NtUserGetWindowDC")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX", a1);
+    } else if (!strcmp(name, "NtUserGetAncestor")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Flags=0x%X",
+            a1, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtUserQueryWindow")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hwnd=0x%llX Class=%u",
+            a1, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtUserGetGuiResources")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Process=0x%llX Flags=0x%X",
+            a1, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtGdiGetTextExtent") ||
+        !strcmp(name, "NtGdiGetTextExtentExW")) {
+        char text[88] = {};
+        ReadWideText(a2, static_cast<ULONG>(a3), text, sizeof(text));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Text=\"%s\" Length=%u Limit=%u",
+            a1, text, static_cast<ULONG>(a3), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtGdiCreateRectRgn") ||
+        !strcmp(name, "NtGdiCreateEllipticRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Rect=(%ld,%ld)-(%ld,%ld)",
+            static_cast<LONG>(a1), static_cast<LONG>(a2),
+            static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtGdiCreateRoundRectRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Rect=(%ld,%ld)-(%ld,%ld)",
+            static_cast<LONG>(a1), static_cast<LONG>(a2),
+            static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtGdiCreateCompatibleBitmap")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX Size=%ldx%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3));
+    } else if (!strcmp(name, "NtGdiCreateBitmap")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Size=%ldx%ld Planes=%u BitsPerPixel=%u",
+            static_cast<LONG>(a1), static_cast<LONG>(a2),
+            static_cast<ULONG>(a3), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtGdiCreateCompatibleDC")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX", a1);
+    } else if (!strcmp(name, "NtGdiDeleteObjectApp")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Object=0x%llX", a1);
+    } else if (!strcmp(name, "NtGdiSelectBitmap") ||
+        !strcmp(name, "NtGdiSelectBrush") || !strcmp(name, "NtGdiSelectPen") ||
+        !strcmp(name, "NtGdiSelectFont")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX Object=0x%llX", a1, a2);
+    } else if (!strcmp(name, "NtGdiCreateSolidBrush")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Color=0x%06X Brush=0x%llX",
+            static_cast<ULONG>(a1) & 0xFFFFFF, a2);
+    } else if (!strcmp(name, "NtGdiCreatePen")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Style=%u Width=%ld Color=0x%06X Brush=0x%llX",
+            static_cast<ULONG>(a1), static_cast<LONG>(a2),
+            static_cast<ULONG>(a3) & 0xFFFFFF, a4);
+    } else if (!strcmp(name, "NtGdiBitBlt") || !strcmp(name, "NtGdiStretchBlt") ||
+        !strcmp(name, "NtGdiPatBlt")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX X=%ld Y=%ld Width=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtGdiRectangle") || !strcmp(name, "NtGdiEllipse") ||
+        !strcmp(name, "NtGdiIntersectClipRect")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX Left=%ld Top=%ld Right=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3), static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtGdiLineTo") || !strcmp(name, "NtGdiMoveTo")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX X=%ld Y=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3));
+    } else if (!strcmp(name, "NtGdiSetPixel")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX X=%ld Y=%ld Color=0x%06X",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3),
+            static_cast<ULONG>(a4) & 0xFFFFFF);
+    } else if (!strcmp(name, "NtGdiGetPixel")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX X=%ld Y=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3));
+    } else if (!strcmp(name, "NtGdiFrameRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Region=0x%llX Brush=0x%llX Width=%ld",
+            a1, a2, a3, static_cast<LONG>(a4));
+    } else if (!strcmp(name, "NtGdiFillRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Region=0x%llX Brush=0x%llX", a1, a2, a3);
+    } else if (!strcmp(name, "NtGdiInvertRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Hdc=0x%llX Region=0x%llX", a1, a2);
+    } else if (!strcmp(name, "NtGdiOffsetRgn")) {
+        RtlStringCbPrintfA(detail, sizeof(detail), "Region=0x%llX X=%ld Y=%ld",
+            a1, static_cast<LONG>(a2), static_cast<LONG>(a3));
+    }
+
+    EnqueueDetail(sequence, detail);
+}
+
 static void RememberHandleName(HANDLE handle, const char* name) {
     if (!handle || !name || !name[0]) return;
     PVOID object = nullptr;
@@ -705,7 +1134,12 @@ static void RememberReturnedHandle(PHANDLE returnedHandle, const char* name, NTS
 }
 
 static void LogRawArguments(ULONG syscallId, const ULONG_PTR* arguments) {
-    EnqueueEvent(syscallId, arguments);
+    ULONGLONG sequence = EnqueueEvent(syscallId, arguments);
+    if (sequence) {
+        USHORT category = gSyscallTable[syscallId].category;
+        if (category == ScallCategoryUser || category == ScallCategoryGraphics)
+            DecodeWin32kArguments(sequence, gSyscallTable[syscallId].name, arguments);
+    }
 }
 
 static void __fastcall SyscallCallback(unsigned int syscallId, void** syscallFunction,
@@ -750,6 +1184,96 @@ static void __fastcall SyscallCallback(unsigned int syscallId, void** syscallFun
     }
     LogRawArguments(syscallId, rawArguments);
     InterlockedDecrement(&gHooksActive);
+}
+
+struct SCALL_SIZE32 {
+    LONG width;
+    LONG height;
+};
+
+static LONG DetGdiExtTextOutW(PVOID hdc, LONG x, LONG y, ULONG options, PVOID rect,
+    PWCHAR text, LONG count, PLONG spacing, ULONG codePage) {
+    InterlockedIncrement(&gHooksActive);
+    __try {
+        char value[84] = {};
+        char bounds[48] = {};
+        if (count > 0) ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
+        ReadRect(reinterpret_cast<ULONG_PTR>(rect), bounds, sizeof(bounds));
+        char detail[160];
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Pos=(%ld,%ld) Options=0x%X Rect=%s Text=\"%s\" CodePage=%u",
+            reinterpret_cast<ULONG_PTR>(hdc), x, y, options, bounds, value, codePage);
+        LogImportant(gIdxGdiExtTextOutW, detail);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    auto original = reinterpret_cast<decltype(&DetGdiExtTextOutW)>(
+        gOriginalFunctions[gIdxGdiExtTextOutW]);
+    LONG result = original ? original(hdc, x, y, options, rect, text, count, spacing, codePage) : 0;
+    char outcome[32];
+    RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
+    LogCurrentOutcome(outcome);
+    InterlockedDecrement(&gHooksActive);
+    return result;
+}
+
+static LONG DetGdiGetTextExtent(PVOID hdc, PWCHAR text, LONG count, PVOID size, ULONG options) {
+    InterlockedIncrement(&gHooksActive);
+    __try {
+        char value[112] = {};
+        if (count > 0) ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
+        char detail[160];
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Text=\"%s\" Length=%ld Options=0x%X",
+            reinterpret_cast<ULONG_PTR>(hdc), value, count, options);
+        LogImportant(gIdxGdiGetTextExtent, detail);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    auto original = reinterpret_cast<decltype(&DetGdiGetTextExtent)>(
+        gOriginalFunctions[gIdxGdiGetTextExtent]);
+    LONG result = original ? original(hdc, text, count, size, options) : 0;
+    SCALL_SIZE32 extent = {};
+    char outcome[64];
+    if (result && ReadUserValue(reinterpret_cast<ULONG_PTR>(size), &extent))
+        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X Size=%ldx%ld",
+            static_cast<ULONG>(result), extent.width, extent.height);
+    else
+        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
+    LogCurrentOutcome(outcome);
+    InterlockedDecrement(&gHooksActive);
+    return result;
+}
+
+static LONG DetGdiGetTextExtentExW(PVOID hdc, PWCHAR text, ULONG count, ULONG maximum,
+    PULONG fitted, PULONG spacing, PVOID size, ULONG flags) {
+    InterlockedIncrement(&gHooksActive);
+    __try {
+        char value[104] = {};
+        ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
+        char detail[160];
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Hdc=0x%llX Text=\"%s\" Length=%u Maximum=%u Flags=0x%X",
+            reinterpret_cast<ULONG_PTR>(hdc), value, count, maximum, flags);
+        LogImportant(gIdxGdiGetTextExtentExW, detail);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    auto original = reinterpret_cast<decltype(&DetGdiGetTextExtentExW)>(
+        gOriginalFunctions[gIdxGdiGetTextExtentExW]);
+    LONG result = original ? original(hdc, text, count, maximum, fitted, spacing, size, flags) : 0;
+    ULONG characters = 0;
+    SCALL_SIZE32 extent = {};
+    BOOLEAN haveCharacters = ReadUserValue(reinterpret_cast<ULONG_PTR>(fitted), &characters);
+    BOOLEAN haveSize = ReadUserValue(reinterpret_cast<ULONG_PTR>(size), &extent);
+    char outcome[72];
+    if (result && haveSize) {
+        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X Size=%ldx%ld Fitted=%u",
+            static_cast<ULONG>(result), extent.width, extent.height,
+            haveCharacters ? characters : 0);
+    } else {
+        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
+    }
+    LogCurrentOutcome(outcome);
+    InterlockedDecrement(&gHooksActive);
+    return result;
 }
 
 static NTSTATUS DetCreateFile(PHANDLE file, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,

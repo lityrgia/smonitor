@@ -1,5 +1,5 @@
-pub const PROTOCOL_VERSION: u32 = 9;
-pub const MAX_SYSCALLS: usize = 0x1000;
+pub const PROTOCOL_VERSION: u32 = 10;
+pub const MAX_SYSCALLS: usize = 0x2000;
 pub const MAX_TARGET_PIDS: usize = 16;
 pub const MAX_TARGET_NAMES: usize = 16;
 pub const PROCESS_NAME_BYTES: usize = 16;
@@ -7,8 +7,9 @@ pub const OPERATION_MASK_WORDS: usize = MAX_SYSCALLS / 32;
 pub const UNKNOWN_RESULT: &str = "unknown";
 pub const EVENT_FLAG_ARGUMENTS_VALID: u32 = 1;
 
-pub const CATEGORIES: [&str; 10] = [
-    "File", "Registry", "Process", "Thread", "Memory", "Security", "IPC", "Sync", "System", "Other",
+pub const CATEGORIES: [&str; 12] = [
+    "File", "Registry", "Process", "Thread", "Memory", "Security", "IPC", "Sync", "System",
+    "Other", "User", "Graphics",
 ];
 pub const ALL_CATEGORIES: u32 = (1 << CATEGORIES.len()) - 1;
 
@@ -179,7 +180,7 @@ impl RawSyscallInfo {
 }
 
 const _: () = assert!(size_of::<RawEvent>() == 80);
-const _: () = assert!(size_of::<DriverConfig>() == 856);
+const _: () = assert!(size_of::<DriverConfig>() == 1368);
 const _: () = assert!(size_of::<DriverStats>() == 56);
 #[cfg(windows)]
 const _: () = assert!(size_of::<RawDetail>() == 176);

@@ -9,8 +9,8 @@
 #define SCALL_IOCTL_GET_TABLE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_OUT_DIRECT, FILE_READ_DATA)
 #define SCALL_IOCTL_READ_DETAILS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_OUT_DIRECT, FILE_READ_DATA)
 
-#define SCALL_PROTOCOL_VERSION 9u
-#define SCALL_MAX_SYSCALLS 0x1000u
+#define SCALL_PROTOCOL_VERSION 10u
+#define SCALL_MAX_SYSCALLS 0x2000u
 #define SCALL_MAX_TARGET_PIDS 16u
 #define SCALL_MAX_TARGET_NAMES 16u
 #define SCALL_PROCESS_NAME_BYTES 16u
@@ -28,9 +28,11 @@ enum SCALL_CATEGORY : unsigned short {
     ScallCategorySync = 7,
     ScallCategorySystem = 8,
     ScallCategoryOther = 9,
+    ScallCategoryUser = 10,
+    ScallCategoryGraphics = 11,
 };
 
-#define SCALL_ALL_CATEGORIES ((1u << 10) - 1u)
+#define SCALL_ALL_CATEGORIES ((1u << 12) - 1u)
 
 struct SCALL_EVENT {
     unsigned long long qpc;

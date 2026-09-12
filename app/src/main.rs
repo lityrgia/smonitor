@@ -17,14 +17,15 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use protocol::{
-    ALL_CATEGORIES, CATEGORIES, DriverConfig, DriverStats, MAX_SYSCALLS, MAX_TARGET_NAMES,
-    MAX_TARGET_PIDS, OPERATION_MASK_WORDS, PROCESS_NAME_BYTES, RawEvent, UNKNOWN_RESULT,
+    CATEGORIES, DriverConfig, DriverStats, MAX_SYSCALLS, MAX_TARGET_NAMES, MAX_TARGET_PIDS,
+    OPERATION_MASK_WORDS, PROCESS_NAME_BYTES, RawEvent, UNKNOWN_RESULT,
 };
 use source::{SourceCommand, SourceHandle, SourceMessage};
 use sysinfo::System;
 
 const ESTIMATED_BYTES_PER_EVENT: usize = 176;
 const DEFAULT_EXCLUDED_OPERATION: &str = "NtDeviceIoControlFile";
+const DEFAULT_CATEGORY_MASK: u32 = protocol::ALL_CATEGORIES & ((1 << 10) - 1);
 
 #[derive(Clone)]
 struct ProcessRow {
@@ -97,7 +98,7 @@ struct MonitorApp {
     syscall_names: Vec<String>,
     details: HashMap<u64, String>,
     outcomes: HashMap<u64, String>,
-    category_counts: [u64; 10],
+    category_counts: [u64; CATEGORIES.len()],
     stats: DriverStats,
     status: String,
     capture: bool,
@@ -142,11 +143,11 @@ impl MonitorApp {
             syscall_names: vec![String::new(); MAX_SYSCALLS],
             details: HashMap::new(),
             outcomes: HashMap::new(),
-            category_counts: [0; 10],
+            category_counts: [0; CATEGORIES.len()],
             stats: DriverStats::default(),
             status: "Connecting…".into(),
             capture: true,
-            category_mask: ALL_CATEGORIES,
+            category_mask: DEFAULT_CATEGORY_MASK,
             included_operations: HashSet::new(),
             excluded_operations: HashSet::from([DEFAULT_EXCLUDED_OPERATION.to_owned()]),
             operation_filter_input: String::new(),
@@ -533,7 +534,7 @@ impl MonitorApp {
         self.visible.clear();
         self.details.clear();
         self.outcomes.clear();
-        self.category_counts = [0; 10];
+        self.category_counts = [0; CATEGORIES.len()];
         self.history_evicted = 0;
         self.selected = None;
         self.filters_dirty = true;
@@ -555,7 +556,7 @@ impl MonitorApp {
                 self.visible.clear();
                 self.details.clear();
                 self.outcomes.clear();
-                self.category_counts = [0; 10];
+                self.category_counts = [0; CATEGORIES.len()];
                 self.history_evicted = 0;
                 self.selected = None;
             }
@@ -747,7 +748,7 @@ impl MonitorApp {
                 self.search.clear();
                 self.process_filter.clear();
                 self.tid_filter.clear();
-                self.category_mask = ALL_CATEGORIES;
+                self.category_mask = DEFAULT_CATEGORY_MASK;
                 self.included_operations.clear();
                 self.excluded_operations = HashSet::from([DEFAULT_EXCLUDED_OPERATION.to_owned()]);
                 changed = true;
@@ -1160,6 +1161,8 @@ fn category_color(category: u16, dark_mode: bool) -> Color32 {
         Color32::from_rgb(255, 160, 122),
         Color32::from_rgb(144, 238, 144),
         Color32::from_rgb(195, 199, 207),
+        Color32::from_rgb(255, 121, 121),
+        Color32::from_rgb(91, 206, 250),
     ];
     let light = [
         Color32::from_rgb(0, 84, 166),
@@ -1172,6 +1175,8 @@ fn category_color(category: u16, dark_mode: bool) -> Color32 {
         Color32::from_rgb(163, 56, 25),
         Color32::from_rgb(24, 110, 54),
         Color32::from_rgb(65, 68, 74),
+        Color32::from_rgb(165, 28, 48),
+        Color32::from_rgb(0, 96, 160),
     ];
     (if dark_mode { dark } else { light })
         .get(category as usize)
