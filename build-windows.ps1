@@ -130,9 +130,21 @@ foreach ($artifact in @($driverSource, $guiSource)) {
 New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
 Copy-Item -LiteralPath $driverSource -Destination (Join-Path $distDirectory "swatcher.sys") -Force
 Copy-Item -LiteralPath $guiSource -Destination (Join-Path $distDirectory "smonitor.exe") -Force
+$filterExampleDestination = Join-Path $distDirectory "filters.example.json"
+if (-not (Test-Path -LiteralPath $filterExampleDestination)) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "filters.example.json") `
+        -Destination $filterExampleDestination
+}
+$filterDestination = Join-Path $distDirectory "filters.json"
+if (-not (Test-Path -LiteralPath $filterDestination)) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "filters.example.json") `
+        -Destination $filterDestination
+}
 
 Write-Host "Built artifacts:"
 @(
     Get-Item (Join-Path $distDirectory "smonitor.exe")
     Get-Item (Join-Path $distDirectory "swatcher.sys")
+    Get-Item $filterExampleDestination
+    Get-Item $filterDestination
 ) | Select-Object Name, Length, LastWriteTime

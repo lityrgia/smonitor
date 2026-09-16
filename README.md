@@ -14,9 +14,10 @@ method.
 
 ## Features
 
-- Live syscall view with process names, icons, PID/TID, arguments, and available NTSTATUS results
+- Live syscall view with process names, icons, PID/TID, and entry arguments
 - Kernel-side filtering by process name, PID, operation, and category
 - Include/exclude operation rules and GUI search filters
+- JSON operation filters with first-four-argument conditions
 - Bounded kernel queues and configurable GUI memory usage
 - CSV, JSONL, and TXT export
 - Light and dark themes
@@ -35,9 +36,10 @@ through bounded queues. Process and operation filters are applied in the driver 
 queued.
 
 Common file, registry, process, thread, memory, token, IPC, and synchronization calls have typed
-decoders. They can show object paths, access masks, sizes, protection flags, target PIDs, and the
-immediate NTSTATUS result. Other calls show their first four raw arguments; their result is displayed
-as `unknown` when no return detour is installed.
+decoders. They can show object paths, access masks, sizes, protection flags, target PIDs/process
+names, and other input data. `NtOpenKeyEx` shows the registry key path, requested access, and open
+options. Other calls show their first four raw arguments. The monitor does not replace syscall
+targets or collect return values.
 
 Experimental Win32k capture is available for `NtUser*`, `NtGdi*`, and related calls exported by
 `win32u.dll`. Enable the **User** or **Graphics** category together with a process filter; both are
@@ -71,6 +73,35 @@ swatcher.sys
 
 Release builds use kdmapper to load the driver. Run `start.bat` as
 Administrator.
+
+### JSON filters
+
+Open the **...** operation menu, enter a JSON file name, and press **Load**. Relative paths are
+resolved next to `smonitor.exe`. Builds create a starter `filters.json` without overwriting an
+existing file; the original template is also included as `filters.example.json`:
+
+```json
+{
+  "include": [],
+  "exclude": ["NtDeviceIoControlFile"],
+  "rules": [
+    {
+      "op": "NtOpenProcess",
+      "skip": { "arg1": "0x100" }
+    },
+    {
+      "op": "NtWriteVirtualMemory",
+      "only": { "arg1": "0x40", "arg4": 4096 }
+    }
+  ]
+}
+```
+
+`skip` drops the call when all listed arguments match. `only` does the opposite: for that operation,
+only calls matching at least one `only` rule are retained. Conditions inside one rule use AND;
+multiple rules use OR. Use `arg1` through `arg4`. Values accept JSON unsigned numbers or strings
+such as `"0x100"`. Up to 128 rules are applied in the driver before events enter the queue. The old
+verbose syntax remains readable for compatibility.
 
 ## Platform
 

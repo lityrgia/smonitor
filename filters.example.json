@@ -1,0 +1,14 @@
+{
+  "include": [],
+  "exclude": [
+    "NtDeviceIoControlFile"
+  ],
+  "rules": [
+    {
+      "op": "NtOpenProcess",
+      "skip": {
+        "arg1": "0x100"
+      }
+    }
+  ]
+}

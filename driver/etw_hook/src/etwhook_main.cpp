@@ -12,14 +12,13 @@ extern "C" NTKERNELAPI PCHAR PsGetProcessImageFileName(PEPROCESS Process);
 
 #define LOG_RING_ENTRIES (64 * 1024)
 #define DETAIL_RING_ENTRIES (32 * 1024)
-#define HANDLE_NAME_ENTRIES (2 * 1024)
-#define RESULT_SLOT_ENTRIES (4 * 1024)
-#define RESULT_STACK_DEPTH 4
 #define POOL_TAG 'gLsS'
 
 static_assert((LOG_RING_ENTRIES & (LOG_RING_ENTRIES - 1)) == 0, "ring size must be a power of two");
 static_assert(sizeof(SCALL_EVENT) == 80, "SCALL_EVENT ABI changed");
-static_assert(sizeof(SCALL_CONFIG) == 1368, "SCALL_CONFIG ABI changed");
+static_assert(sizeof(SCALL_ARGUMENT_CONDITION) == 16, "SCALL_ARGUMENT_CONDITION ABI changed");
+static_assert(sizeof(SCALL_ARGUMENT_RULE) == 72, "SCALL_ARGUMENT_RULE ABI changed");
+static_assert(sizeof(SCALL_CONFIG) == 10592, "SCALL_CONFIG ABI changed");
 static_assert(sizeof(SCALL_STATS) == 56, "SCALL_STATS ABI changed");
 static_assert(sizeof(SCALL_DETAIL) == 176, "SCALL_DETAIL ABI changed");
 
@@ -37,27 +36,7 @@ static ULONG gTail = 0;
 static ULONG gDetailHead = 0;
 static ULONG gDetailTail = 0;
 static KSPIN_LOCK gRingLock;
-static KSPIN_LOCK gHandleNameLock;
-static KSPIN_LOCK gResultLock;
 static PDEVICE_OBJECT gDeviceObject = nullptr;
-
-struct HANDLE_NAME_ENTRY {
-    PEPROCESS process;
-    HANDLE handle;
-    PVOID object;
-    char name[112];
-};
-
-static HANDLE_NAME_ENTRY gHandleNames[HANDLE_NAME_ENTRIES] = {};
-static ULONG gHandleNameNext = 0;
-
-struct RESULT_SLOT {
-    PETHREAD thread;
-    ULONG depth;
-    ULONGLONG sequences[RESULT_STACK_DEPTH];
-};
-
-static RESULT_SLOT gResultSlots[RESULT_SLOT_ENTRIES] = {};
 
 static volatile LONG gUnloading = 0;
 static volatile LONG gHooksActive = 0;
@@ -70,6 +49,10 @@ static volatile LONG gTargetNameWords[SCALL_MAX_TARGET_NAMES]
 static volatile LONG gTargetFilterUpdating = 0;
 static volatile LONG gOperationMask[SCALL_OPERATION_MASK_WORDS] = {};
 static volatile LONG gOperationFilterUpdating = 0;
+static SCALL_ARGUMENT_RULE gArgumentRules[SCALL_MAX_ARGUMENT_RULES] = {};
+static volatile LONG gArgumentRuleCount = 0;
+static volatile LONG gArgumentFilterUpdating = 0;
+static volatile LONG gArgumentRuleOperationMask[SCALL_OPERATION_MASK_WORDS] = {};
 static volatile LONG gExcludedPid = 0;
 static volatile LONG gCategoryMask = SCALL_ALL_CATEGORIES;
 static volatile LONG64 gSequence = 0;
@@ -77,219 +60,6 @@ static volatile LONG64 gCaptured = 0;
 static volatile LONG64 gDelivered = 0;
 static volatile LONG64 gDropped = 0;
 static volatile LONG64 gDetailsDropped = 0;
-static PVOID volatile gOriginalFunctions[SCALL_MAX_SYSCALLS] = {};
-static PVOID gDetourFunctions[SCALL_MAX_SYSCALLS] = {};
-
-static ULONG gIdxCreateFile = MAXULONG;
-static ULONG gIdxOpenProcess = MAXULONG;
-static ULONG gIdxAllocateVirtualMemory = MAXULONG;
-static ULONG gIdxProtectVirtualMemory = MAXULONG;
-static ULONG gIdxWriteVirtualMemory = MAXULONG;
-static ULONG gIdxCreateThreadEx = MAXULONG;
-static ULONG gIdxOpenKey = MAXULONG;
-static ULONG gIdxSetValueKey = MAXULONG;
-static ULONG gIdxOpenFile = MAXULONG;
-static ULONG gIdxQueryAttributesFile = MAXULONG;
-static ULONG gIdxQueryFullAttributesFile = MAXULONG;
-static ULONG gIdxQueryDirectoryFile = MAXULONG;
-static ULONG gIdxQueryDirectoryFileEx = MAXULONG;
-static ULONG gIdxDeviceIoControlFile = MAXULONG;
-static ULONG gIdxOpenKeyEx = MAXULONG;
-static ULONG gIdxCreateKey = MAXULONG;
-static ULONG gIdxQueryValueKey = MAXULONG;
-static ULONG gIdxDeleteValueKey = MAXULONG;
-static ULONG gIdxRenameKey = MAXULONG;
-static ULONG gIdxOpenSection = MAXULONG;
-static ULONG gIdxCreateEvent = MAXULONG;
-static ULONG gIdxOpenEvent = MAXULONG;
-static ULONG gIdxCreateMutant = MAXULONG;
-static ULONG gIdxOpenMutant = MAXULONG;
-static ULONG gIdxCreateSemaphore = MAXULONG;
-static ULONG gIdxOpenSemaphore = MAXULONG;
-static ULONG gIdxCreateTimer = MAXULONG;
-static ULONG gIdxOpenDirectoryObject = MAXULONG;
-static ULONG gIdxOpenSymbolicLinkObject = MAXULONG;
-static ULONG gIdxConnectPort = MAXULONG;
-static ULONG gIdxSecureConnectPort = MAXULONG;
-static ULONG gIdxAlpcConnectPort = MAXULONG;
-static ULONG gIdxAlpcConnectPortEx = MAXULONG;
-static ULONG gIdxLoadDriver = MAXULONG;
-static ULONG gIdxReadFile = MAXULONG;
-static ULONG gIdxWriteFile = MAXULONG;
-static ULONG gIdxQueryInformationFile = MAXULONG;
-static ULONG gIdxSetInformationFile = MAXULONG;
-static ULONG gIdxFsControlFile = MAXULONG;
-static ULONG gIdxQueryKey = MAXULONG;
-static ULONG gIdxDeleteKey = MAXULONG;
-static ULONG gIdxEnumerateKey = MAXULONG;
-static ULONG gIdxEnumerateValueKey = MAXULONG;
-static ULONG gIdxFreeVirtualMemory = MAXULONG;
-static ULONG gIdxReadVirtualMemory = MAXULONG;
-static ULONG gIdxMapViewOfSection = MAXULONG;
-static ULONG gIdxUnmapViewOfSection = MAXULONG;
-static ULONG gIdxTerminateProcess = MAXULONG;
-static ULONG gIdxQueryInformationProcess = MAXULONG;
-static ULONG gIdxSetInformationProcess = MAXULONG;
-static ULONG gIdxOpenThread = MAXULONG;
-static ULONG gIdxSuspendThread = MAXULONG;
-static ULONG gIdxResumeThread = MAXULONG;
-static ULONG gIdxQueueApcThread = MAXULONG;
-static ULONG gIdxOpenProcessToken = MAXULONG;
-static ULONG gIdxOpenThreadTokenEx = MAXULONG;
-static ULONG gIdxAdjustPrivilegesToken = MAXULONG;
-static ULONG gIdxReleaseMutant = MAXULONG;
-static ULONG gIdxAlpcSendWaitReceivePort = MAXULONG;
-static ULONG gIdxQuerySystemInformation = MAXULONG;
-static ULONG gIdxGdiExtTextOutW = MAXULONG;
-static ULONG gIdxGdiGetTextExtent = MAXULONG;
-static ULONG gIdxGdiGetTextExtentExW = MAXULONG;
-
-static NTSTATUS DetCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
-    PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-static NTSTATUS DetOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-static NTSTATUS DetAllocateVirtualMemory(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-static NTSTATUS DetProtectVirtualMemory(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
-static NTSTATUS DetWriteVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-static NTSTATUS DetCreateThreadEx(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE, PVOID,
-    PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
-static NTSTATUS DetOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
-static NTSTATUS DetOpenFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
-static NTSTATUS DetQueryAttributesFile(POBJECT_ATTRIBUTES, PVOID);
-static NTSTATUS DetQueryFullAttributesFile(POBJECT_ATTRIBUTES, PVOID);
-static NTSTATUS DetQueryDirectoryFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID,
-    ULONG, ULONG, BOOLEAN, PUNICODE_STRING, BOOLEAN);
-static NTSTATUS DetQueryDirectoryFileEx(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID,
-    ULONG, ULONG, ULONG, PUNICODE_STRING);
-static NTSTATUS DetDeviceIoControlFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, ULONG,
-    PVOID, ULONG, PVOID, ULONG);
-static NTSTATUS DetOpenKeyEx(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
-static NTSTATUS DetCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING,
-    ULONG, PULONG);
-static NTSTATUS DetQueryValueKey(HANDLE, PUNICODE_STRING, ULONG, PVOID, ULONG, PULONG);
-static NTSTATUS DetDeleteValueKey(HANDLE, PUNICODE_STRING);
-static NTSTATUS DetRenameKey(HANDLE, PUNICODE_STRING);
-static NTSTATUS DetOpenSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetCreateEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, EVENT_TYPE, BOOLEAN);
-static NTSTATUS DetOpenEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetCreateMutant(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, BOOLEAN);
-static NTSTATUS DetOpenMutant(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetCreateSemaphore(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, LONG, LONG);
-static NTSTATUS DetOpenSemaphore(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetCreateTimer(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, TIMER_TYPE);
-static NTSTATUS DetOpenDirectoryObject(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetOpenSymbolicLinkObject(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-static NTSTATUS DetConnectPort(PHANDLE, PUNICODE_STRING, PVOID, PVOID, PVOID, PULONG, PVOID, PULONG);
-static NTSTATUS DetSecureConnectPort(PHANDLE, PUNICODE_STRING, PVOID, PVOID, PVOID, PVOID,
-    PULONG, PVOID, PULONG);
-static NTSTATUS DetAlpcConnectPort(PHANDLE, PUNICODE_STRING, POBJECT_ATTRIBUTES, PVOID, ULONG,
-    PVOID, PVOID, PSIZE_T, PVOID, PVOID, PVOID);
-static NTSTATUS DetAlpcConnectPortEx(PHANDLE, POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, PVOID,
-    ULONG, PVOID, PVOID, PSIZE_T, PVOID, PVOID, PVOID);
-static NTSTATUS DetLoadDriver(PUNICODE_STRING);
-static NTSTATUS DetReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PVOID, PVOID);
-static NTSTATUS DetWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PVOID, PVOID);
-static NTSTATUS DetQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-static NTSTATUS DetSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-static NTSTATUS DetFsControlFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, ULONG, PVOID,
-    ULONG, PVOID, ULONG);
-static NTSTATUS DetQueryKey(HANDLE, ULONG, PVOID, ULONG, PULONG);
-static NTSTATUS DetDeleteKey(HANDLE);
-static NTSTATUS DetEnumerateKey(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG);
-static NTSTATUS DetEnumerateValueKey(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG);
-static NTSTATUS DetFreeVirtualMemory(HANDLE, PVOID*, PSIZE_T, ULONG);
-static NTSTATUS DetReadVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-static NTSTATUS DetMapViewOfSection(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PVOID, PSIZE_T,
-    ULONG, ULONG, ULONG);
-static NTSTATUS DetUnmapViewOfSection(HANDLE, PVOID);
-static NTSTATUS DetTerminateProcess(HANDLE, NTSTATUS);
-static NTSTATUS DetQueryInformationProcess(HANDLE, ULONG, PVOID, ULONG, PULONG);
-static NTSTATUS DetSetInformationProcess(HANDLE, ULONG, PVOID, ULONG);
-static NTSTATUS DetOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-static NTSTATUS DetSuspendThread(HANDLE, PULONG);
-static NTSTATUS DetResumeThread(HANDLE, PULONG);
-static NTSTATUS DetQueueApcThread(HANDLE, PVOID, PVOID, PVOID, PVOID);
-static NTSTATUS DetOpenProcessToken(HANDLE, ACCESS_MASK, PHANDLE);
-static NTSTATUS DetOpenThreadTokenEx(HANDLE, ACCESS_MASK, BOOLEAN, ULONG, PHANDLE);
-static NTSTATUS DetAdjustPrivilegesToken(HANDLE, BOOLEAN, PVOID, ULONG, PVOID, PULONG);
-static NTSTATUS DetReleaseMutant(HANDLE, PULONG);
-static NTSTATUS DetAlpcSendWaitReceivePort(HANDLE, ULONG, PVOID, PVOID, PVOID, PSIZE_T, PVOID, PVOID);
-static NTSTATUS DetQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
-static LONG DetGdiExtTextOutW(PVOID, LONG, LONG, ULONG, PVOID, PWCHAR, LONG, PLONG, ULONG);
-static LONG DetGdiGetTextExtent(PVOID, PWCHAR, LONG, PVOID, ULONG);
-static LONG DetGdiGetTextExtentExW(PVOID, PWCHAR, ULONG, ULONG, PULONG, PULONG, PVOID, ULONG);
-
-struct IMPORTANT_DETOUR {
-    const char* name;
-    ULONG* index;
-    PVOID function;
-};
-
-static IMPORTANT_DETOUR gImportantDetours[] = {
-    { "NtCreateFile", &gIdxCreateFile, reinterpret_cast<PVOID>(DetCreateFile) },
-    { "NtOpenProcess", &gIdxOpenProcess, reinterpret_cast<PVOID>(DetOpenProcess) },
-    { "NtAllocateVirtualMemory", &gIdxAllocateVirtualMemory, reinterpret_cast<PVOID>(DetAllocateVirtualMemory) },
-    { "NtProtectVirtualMemory", &gIdxProtectVirtualMemory, reinterpret_cast<PVOID>(DetProtectVirtualMemory) },
-    { "NtWriteVirtualMemory", &gIdxWriteVirtualMemory, reinterpret_cast<PVOID>(DetWriteVirtualMemory) },
-    { "NtCreateThreadEx", &gIdxCreateThreadEx, reinterpret_cast<PVOID>(DetCreateThreadEx) },
-    { "NtOpenKey", &gIdxOpenKey, reinterpret_cast<PVOID>(DetOpenKey) },
-    { "NtSetValueKey", &gIdxSetValueKey, reinterpret_cast<PVOID>(DetSetValueKey) },
-    { "NtOpenFile", &gIdxOpenFile, reinterpret_cast<PVOID>(DetOpenFile) },
-    { "NtQueryAttributesFile", &gIdxQueryAttributesFile, reinterpret_cast<PVOID>(DetQueryAttributesFile) },
-    { "NtQueryFullAttributesFile", &gIdxQueryFullAttributesFile, reinterpret_cast<PVOID>(DetQueryFullAttributesFile) },
-    { "NtQueryDirectoryFile", &gIdxQueryDirectoryFile, reinterpret_cast<PVOID>(DetQueryDirectoryFile) },
-    { "NtQueryDirectoryFileEx", &gIdxQueryDirectoryFileEx, reinterpret_cast<PVOID>(DetQueryDirectoryFileEx) },
-    { "NtDeviceIoControlFile", &gIdxDeviceIoControlFile, reinterpret_cast<PVOID>(DetDeviceIoControlFile) },
-    { "NtOpenKeyEx", &gIdxOpenKeyEx, reinterpret_cast<PVOID>(DetOpenKeyEx) },
-    { "NtCreateKey", &gIdxCreateKey, reinterpret_cast<PVOID>(DetCreateKey) },
-    { "NtQueryValueKey", &gIdxQueryValueKey, reinterpret_cast<PVOID>(DetQueryValueKey) },
-    { "NtDeleteValueKey", &gIdxDeleteValueKey, reinterpret_cast<PVOID>(DetDeleteValueKey) },
-    { "NtRenameKey", &gIdxRenameKey, reinterpret_cast<PVOID>(DetRenameKey) },
-    { "NtOpenSection", &gIdxOpenSection, reinterpret_cast<PVOID>(DetOpenSection) },
-    { "NtCreateEvent", &gIdxCreateEvent, reinterpret_cast<PVOID>(DetCreateEvent) },
-    { "NtOpenEvent", &gIdxOpenEvent, reinterpret_cast<PVOID>(DetOpenEvent) },
-    { "NtCreateMutant", &gIdxCreateMutant, reinterpret_cast<PVOID>(DetCreateMutant) },
-    { "NtOpenMutant", &gIdxOpenMutant, reinterpret_cast<PVOID>(DetOpenMutant) },
-    { "NtCreateSemaphore", &gIdxCreateSemaphore, reinterpret_cast<PVOID>(DetCreateSemaphore) },
-    { "NtOpenSemaphore", &gIdxOpenSemaphore, reinterpret_cast<PVOID>(DetOpenSemaphore) },
-    { "NtCreateTimer", &gIdxCreateTimer, reinterpret_cast<PVOID>(DetCreateTimer) },
-    { "NtOpenDirectoryObject", &gIdxOpenDirectoryObject, reinterpret_cast<PVOID>(DetOpenDirectoryObject) },
-    { "NtOpenSymbolicLinkObject", &gIdxOpenSymbolicLinkObject, reinterpret_cast<PVOID>(DetOpenSymbolicLinkObject) },
-    { "NtConnectPort", &gIdxConnectPort, reinterpret_cast<PVOID>(DetConnectPort) },
-    { "NtSecureConnectPort", &gIdxSecureConnectPort, reinterpret_cast<PVOID>(DetSecureConnectPort) },
-    { "NtAlpcConnectPort", &gIdxAlpcConnectPort, reinterpret_cast<PVOID>(DetAlpcConnectPort) },
-    { "NtAlpcConnectPortEx", &gIdxAlpcConnectPortEx, reinterpret_cast<PVOID>(DetAlpcConnectPortEx) },
-    { "NtLoadDriver", &gIdxLoadDriver, reinterpret_cast<PVOID>(DetLoadDriver) },
-    { "NtReadFile", &gIdxReadFile, reinterpret_cast<PVOID>(DetReadFile) },
-    { "NtWriteFile", &gIdxWriteFile, reinterpret_cast<PVOID>(DetWriteFile) },
-    { "NtQueryInformationFile", &gIdxQueryInformationFile, reinterpret_cast<PVOID>(DetQueryInformationFile) },
-    { "NtSetInformationFile", &gIdxSetInformationFile, reinterpret_cast<PVOID>(DetSetInformationFile) },
-    { "NtFsControlFile", &gIdxFsControlFile, reinterpret_cast<PVOID>(DetFsControlFile) },
-    { "NtQueryKey", &gIdxQueryKey, reinterpret_cast<PVOID>(DetQueryKey) },
-    { "NtDeleteKey", &gIdxDeleteKey, reinterpret_cast<PVOID>(DetDeleteKey) },
-    { "NtEnumerateKey", &gIdxEnumerateKey, reinterpret_cast<PVOID>(DetEnumerateKey) },
-    { "NtEnumerateValueKey", &gIdxEnumerateValueKey, reinterpret_cast<PVOID>(DetEnumerateValueKey) },
-    { "NtFreeVirtualMemory", &gIdxFreeVirtualMemory, reinterpret_cast<PVOID>(DetFreeVirtualMemory) },
-    { "NtReadVirtualMemory", &gIdxReadVirtualMemory, reinterpret_cast<PVOID>(DetReadVirtualMemory) },
-    { "NtMapViewOfSection", &gIdxMapViewOfSection, reinterpret_cast<PVOID>(DetMapViewOfSection) },
-    { "NtUnmapViewOfSection", &gIdxUnmapViewOfSection, reinterpret_cast<PVOID>(DetUnmapViewOfSection) },
-    { "NtTerminateProcess", &gIdxTerminateProcess, reinterpret_cast<PVOID>(DetTerminateProcess) },
-    { "NtQueryInformationProcess", &gIdxQueryInformationProcess, reinterpret_cast<PVOID>(DetQueryInformationProcess) },
-    { "NtSetInformationProcess", &gIdxSetInformationProcess, reinterpret_cast<PVOID>(DetSetInformationProcess) },
-    { "NtOpenThread", &gIdxOpenThread, reinterpret_cast<PVOID>(DetOpenThread) },
-    { "NtSuspendThread", &gIdxSuspendThread, reinterpret_cast<PVOID>(DetSuspendThread) },
-    { "NtResumeThread", &gIdxResumeThread, reinterpret_cast<PVOID>(DetResumeThread) },
-    { "NtQueueApcThread", &gIdxQueueApcThread, reinterpret_cast<PVOID>(DetQueueApcThread) },
-    { "NtOpenProcessToken", &gIdxOpenProcessToken, reinterpret_cast<PVOID>(DetOpenProcessToken) },
-    { "NtOpenThreadTokenEx", &gIdxOpenThreadTokenEx, reinterpret_cast<PVOID>(DetOpenThreadTokenEx) },
-    { "NtAdjustPrivilegesToken", &gIdxAdjustPrivilegesToken, reinterpret_cast<PVOID>(DetAdjustPrivilegesToken) },
-    { "NtReleaseMutant", &gIdxReleaseMutant, reinterpret_cast<PVOID>(DetReleaseMutant) },
-    { "NtAlpcSendWaitReceivePort", &gIdxAlpcSendWaitReceivePort, reinterpret_cast<PVOID>(DetAlpcSendWaitReceivePort) },
-    { "NtQuerySystemInformation", &gIdxQuerySystemInformation, reinterpret_cast<PVOID>(DetQuerySystemInformation) },
-    { "NtGdiExtTextOutW", &gIdxGdiExtTextOutW, reinterpret_cast<PVOID>(DetGdiExtTextOutW) },
-    { "NtGdiGetTextExtent", &gIdxGdiGetTextExtent, reinterpret_cast<PVOID>(DetGdiGetTextExtent) },
-    { "NtGdiGetTextExtentExW", &gIdxGdiGetTextExtentExW, reinterpret_cast<PVOID>(DetGdiGetTextExtentExW) },
-};
 
 static USHORT ClassifySyscall(const char* name, BOOLEAN win32k) {
     if (win32k) {
@@ -343,13 +113,6 @@ static ULONG ParsePeExports(PVOID imageBase, BOOLEAN win32k) {
             if (id >= SCALL_MAX_SYSCALLS) continue;
             RtlStringCbCopyA(gSyscallTable[id].name, sizeof(gSyscallTable[id].name), name);
             gSyscallTable[id].category = ClassifySyscall(name, win32k);
-            for (auto& detour : gImportantDetours) {
-                if (strcmp(name, detour.name) == 0) {
-                    *detour.index = id;
-                    gDetourFunctions[id] = detour.function;
-                    break;
-                }
-            }
             if (id >= gSyscallCount) gSyscallCount = id + 1;
             ++parsed;
         }
@@ -429,6 +192,37 @@ static BOOLEAN EqualProcessName(const char* left, const char* right) {
     return TRUE;
 }
 
+static BOOLEAN ResolveProcessId(HANDLE processId, ULONG_PTR* resolvedPid,
+    char* processName, SIZE_T processNameSize) {
+    if (!resolvedPid || !processName || processNameSize == 0) return FALSE;
+    *resolvedPid = reinterpret_cast<ULONG_PTR>(processId);
+    processName[0] = 0;
+    if (!processId) return FALSE;
+    PEPROCESS process = nullptr;
+    NTSTATUS status = PsLookupProcessByProcessId(processId, &process);
+    if (!NT_SUCCESS(status) || !process) return FALSE;
+    *resolvedPid = reinterpret_cast<ULONG_PTR>(PsGetProcessId(process));
+    RtlStringCbCopyA(processName, processNameSize, PsGetProcessImageFileName(process));
+    ObDereferenceObject(process);
+    return processName[0] != 0;
+}
+
+static BOOLEAN ResolveProcessHandle(HANDLE processHandle, ULONG_PTR* processId,
+    char* processName, SIZE_T processNameSize) {
+    if (!processId || !processName || processNameSize == 0) return FALSE;
+    *processId = 0;
+    processName[0] = 0;
+    if (!processHandle) return FALSE;
+    PEPROCESS process = nullptr;
+    NTSTATUS status = ObReferenceObjectByHandle(processHandle, 0, *PsProcessType, UserMode,
+        reinterpret_cast<PVOID*>(&process), nullptr);
+    if (!NT_SUCCESS(status) || !process) return FALSE;
+    *processId = reinterpret_cast<ULONG_PTR>(PsGetProcessId(process));
+    RtlStringCbCopyA(processName, processNameSize, PsGetProcessImageFileName(process));
+    ObDereferenceObject(process);
+    return processName[0] != 0;
+}
+
 static BOOLEAN MatchesTargetProcess(ULONG pid) {
     if (InterlockedCompareExchange(&gTargetFilterUpdating, 0, 0)) return FALSE;
     LONG count = InterlockedCompareExchange(&gTargetPidCount, 0, 0);
@@ -462,9 +256,42 @@ static BOOLEAN OperationEnabled(ULONG syscallId) {
     return (mask & (1u << bit)) != 0;
 }
 
+static BOOLEAN ArgumentRulesAllow(ULONG syscallId, const ULONG_PTR* arguments) {
+    if (InterlockedCompareExchange(&gArgumentFilterUpdating, 0, 0)) return FALSE;
+    ULONG operationWord = syscallId / 32;
+    ULONG operationBit = syscallId % 32;
+    ULONG operationMask = static_cast<ULONG>(InterlockedCompareExchange(
+        &gArgumentRuleOperationMask[operationWord], 0, 0));
+    if ((operationMask & (1u << operationBit)) == 0) return TRUE;
+    ULONG count = static_cast<ULONG>(InterlockedCompareExchange(&gArgumentRuleCount, 0, 0));
+    count = min(count, SCALL_MAX_ARGUMENT_RULES);
+    BOOLEAN hasOnlyRule = FALSE;
+    BOOLEAN matchedOnlyRule = FALSE;
+    for (ULONG i = 0; i < count; ++i) {
+        const auto& rule = gArgumentRules[i];
+        if (rule.syscall_id != syscallId) continue;
+        if (rule.action == SCALL_ARGUMENT_RULE_ONLY) hasOnlyRule = TRUE;
+        BOOLEAN matches = arguments != nullptr && rule.condition_count > 0 &&
+            rule.condition_count <= SCALL_MAX_RULE_CONDITIONS;
+        for (ULONG conditionIndex = 0; matches && conditionIndex < rule.condition_count;
+             ++conditionIndex) {
+            const auto& condition = rule.conditions[conditionIndex];
+            if (condition.argument_index >= SCALL_MAX_RULE_CONDITIONS ||
+                static_cast<ULONGLONG>(arguments[condition.argument_index]) != condition.value) {
+                matches = FALSE;
+            }
+        }
+        if (matches && rule.action == SCALL_ARGUMENT_RULE_EXCEPT) return FALSE;
+        if (matches && rule.action == SCALL_ARGUMENT_RULE_ONLY) matchedOnlyRule = TRUE;
+    }
+    if (InterlockedCompareExchange(&gArgumentFilterUpdating, 0, 0)) return FALSE;
+    return !hasOnlyRule || matchedOnlyRule;
+}
+
 static ULONGLONG EnqueueEvent(ULONG syscallId, const ULONG_PTR* arguments = nullptr) {
     if (gUnloading || !gCaptureEnabled || syscallId >= SCALL_MAX_SYSCALLS) return 0;
     if (!OperationEnabled(syscallId)) return 0;
+    if (!ArgumentRulesAllow(syscallId, arguments)) return 0;
     ULONG pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId()));
     ULONG excludedPid = static_cast<ULONG>(InterlockedCompareExchange(&gExcludedPid, 0, 0));
     if (excludedPid && excludedPid == pid) return 0;
@@ -506,11 +333,10 @@ static ULONGLONG EnqueueEvent(ULONG syscallId, const ULONG_PTR* arguments = null
     return event.sequence;
 }
 
-static void EnqueueDetailKind(ULONGLONG sequence, USHORT kind, const char* text) {
+static void EnqueueDetail(ULONGLONG sequence, const char* text) {
     if (!sequence || !text || !text[0]) return;
     SCALL_DETAIL detail = {};
     detail.sequence = sequence;
-    detail.kind = kind;
     SIZE_T length = strnlen(text, sizeof(detail.text) - 1);
     detail.length = static_cast<USHORT>(length);
     RtlCopyMemory(detail.text, text, length);
@@ -524,84 +350,6 @@ static void EnqueueDetailKind(ULONGLONG sequence, USHORT kind, const char* text)
     gDetailRing[gDetailHead & (DETAIL_RING_ENTRIES - 1)] = detail;
     ++gDetailHead;
     KeReleaseSpinLock(&gRingLock, oldIrql);
-}
-
-static void EnqueueDetail(ULONGLONG sequence, const char* text) {
-    EnqueueDetailKind(sequence, 0, text);
-}
-
-static RESULT_SLOT* FindResultSlot(PETHREAD thread, BOOLEAN create) {
-    constexpr ULONG_PTR tombstone = 1;
-    ULONG start = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(thread) >> 4) &
-        (RESULT_SLOT_ENTRIES - 1);
-    RESULT_SLOT* reusable = nullptr;
-    for (ULONG probe = 0; probe < RESULT_SLOT_ENTRIES; ++probe) {
-        auto slot = &gResultSlots[(start + probe) & (RESULT_SLOT_ENTRIES - 1)];
-        if (slot->thread == thread) return slot;
-        ULONG_PTR owner = reinterpret_cast<ULONG_PTR>(slot->thread);
-        if (owner == tombstone) {
-            if (!reusable) reusable = slot;
-            continue;
-        }
-        if (!owner) return create ? (reusable ? reusable : slot) : nullptr;
-    }
-    return create ? reusable : nullptr;
-}
-
-static BOOLEAN BeginImportant(ULONGLONG sequence) {
-    if (!sequence) return FALSE;
-    PETHREAD thread = PsGetCurrentThread();
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&gResultLock, &oldIrql);
-    auto slot = FindResultSlot(thread, TRUE);
-    BOOLEAN stored = slot && slot->depth < RESULT_STACK_DEPTH;
-    if (stored) {
-        if (slot->thread != thread) {
-            slot->thread = thread;
-            slot->depth = 0;
-        }
-        slot->sequences[slot->depth++] = sequence;
-    }
-    KeReleaseSpinLock(&gResultLock, oldIrql);
-    if (!stored) InterlockedIncrement64(&gDetailsDropped);
-    return stored;
-}
-
-static ULONGLONG CurrentImportantSequence() {
-    PETHREAD thread = PsGetCurrentThread();
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&gResultLock, &oldIrql);
-    auto slot = FindResultSlot(thread, FALSE);
-    ULONGLONG sequence = slot && slot->depth ? slot->sequences[slot->depth - 1] : 0;
-    KeReleaseSpinLock(&gResultLock, oldIrql);
-    return sequence;
-}
-
-static void LogImportant(ULONG syscallId, const char* text) {
-    UNREFERENCED_PARAMETER(syscallId);
-    EnqueueDetail(CurrentImportantSequence(), text);
-}
-
-static ULONGLONG PopImportantSequence() {
-    PETHREAD thread = PsGetCurrentThread();
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&gResultLock, &oldIrql);
-    auto slot = FindResultSlot(thread, FALSE);
-    ULONGLONG sequence = slot && slot->depth ? slot->sequences[--slot->depth] : 0;
-    if (slot && !slot->depth) slot->thread = reinterpret_cast<PETHREAD>(1);
-    KeReleaseSpinLock(&gResultLock, oldIrql);
-    return sequence;
-}
-
-static void LogCurrentOutcome(const char* result) {
-    ULONGLONG sequence = PopImportantSequence();
-    if (sequence) EnqueueDetailKind(sequence, 1, result);
-}
-
-static void LogCurrentResult(NTSTATUS status) {
-    char result[32];
-    RtlStringCbPrintfA(result, sizeof(result), "0x%08X", static_cast<ULONG>(status));
-    LogCurrentOutcome(result);
 }
 
 static void ReadUnicode(PUNICODE_STRING source, char* output, ULONG outputSize) {
@@ -669,11 +417,40 @@ static void ReadUnicode(PUNICODE_STRING source, char* output, ULONG outputSize) 
     }
 }
 
+static BOOLEAN ReadHandleObjectName(HANDLE handle, char* output, ULONG outputSize) {
+    output[0] = 0;
+    if (!handle || outputSize < 2 || KeGetCurrentIrql() != PASSIVE_LEVEL) return FALSE;
+    PVOID object = nullptr;
+    NTSTATUS status = ObReferenceObjectByHandle(
+        handle, 0, nullptr, UserMode, &object, nullptr);
+    if (!NT_SUCCESS(status) || !object) return FALSE;
+    alignas(PVOID) UCHAR nameBuffer[512] = {};
+    ULONG required = 0;
+    status = ObQueryNameString(object, reinterpret_cast<POBJECT_NAME_INFORMATION>(nameBuffer),
+        sizeof(nameBuffer), &required);
+    if (NT_SUCCESS(status)) {
+        auto information = reinterpret_cast<POBJECT_NAME_INFORMATION>(nameBuffer);
+        ReadUnicode(&information->Name, output, outputSize);
+    }
+    ObDereferenceObject(object);
+    return NT_SUCCESS(status) && output[0] != 0;
+}
+
 static void ReadObjectPath(POBJECT_ATTRIBUTES attributes, char* output, ULONG outputSize) {
     output[0] = 0;
     if (!attributes || outputSize < 2) return;
     __try {
-        ReadUnicode(attributes->ObjectName, output, outputSize);
+        OBJECT_ATTRIBUTES snapshot = *attributes;
+        char relative[128] = {};
+        ReadUnicode(snapshot.ObjectName, relative, sizeof(relative));
+        if (snapshot.RootDirectory && relative[0] && relative[0] != '\\') {
+            char root[128] = {};
+            if (ReadHandleObjectName(snapshot.RootDirectory, root, sizeof(root))) {
+                RtlStringCbPrintfA(output, outputSize, "%s\\%s", root, relative);
+                return;
+            }
+        }
+        RtlStringCbCopyA(output, outputSize, relative);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         RtlStringCbCopyA(output, outputSize, "<unreadable>");
@@ -1078,1399 +855,184 @@ static void DecodeWin32kArguments(ULONGLONG sequence, const char* name,
     EnqueueDetail(sequence, detail);
 }
 
-static void RememberHandleName(HANDLE handle, const char* name) {
-    if (!handle || !name || !name[0]) return;
-    PVOID object = nullptr;
-    if (!NT_SUCCESS(ObReferenceObjectByHandle(
-        handle, 0, nullptr, UserMode, &object, nullptr))) return;
-    PEPROCESS process = PsGetCurrentProcess();
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&gHandleNameLock, &oldIrql);
-    HANDLE_NAME_ENTRY* entry = nullptr;
-    for (ULONG i = 0; i < HANDLE_NAME_ENTRIES; ++i) {
-        if (gHandleNames[i].process == process && gHandleNames[i].handle == handle) {
-            entry = &gHandleNames[i];
-            break;
+static void FormatHandleName(ULONG_PTR value, char* output, ULONG outputSize) {
+    if (!ReadHandleObjectName(reinterpret_cast<HANDLE>(value), output, outputSize))
+        RtlStringCbPrintfA(output, outputSize, "0x%llX", value);
+}
+
+static void DecodeNativeArguments(ULONGLONG sequence, const char* name,
+    const ULONG_PTR* arguments) {
+    if (!sequence || !name || !arguments) return;
+    const ULONG_PTR a1 = arguments[0];
+    const ULONG_PTR a2 = arguments[1];
+    const ULONG_PTR a3 = arguments[2];
+    const ULONG_PTR a4 = arguments[3];
+    char detail[160] = {};
+
+    if (!strcmp(name, "NtOpenKeyEx")) {
+        char path[112] = {};
+        ReadObjectPath(reinterpret_cast<POBJECT_ATTRIBUTES>(a3), path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=Open Key=\"%s\" Access=0x%X OpenOptions=0x%X",
+            path, static_cast<ULONG>(a2), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtOpenKey")) {
+        char path[120] = {};
+        ReadObjectPath(reinterpret_cast<POBJECT_ATTRIBUTES>(a3), path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=Open Key=\"%s\" Access=0x%X", path, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtCreateKey")) {
+        char path[112] = {};
+        ReadObjectPath(reinterpret_cast<POBJECT_ATTRIBUTES>(a3), path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=Create/Open Key=\"%s\" Access=0x%X TitleIndex=%u",
+            path, static_cast<ULONG>(a2), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtSetValueKey")) {
+        char key[88] = {};
+        char value[48] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        ReadUnicodeArgument(a2, value, sizeof(value));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=SetValue Key=\"%s\" Value=\"%s\" Type=%u",
+            key, value, static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtDeleteValueKey")) {
+        char key[88] = {};
+        char value[48] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        ReadUnicodeArgument(a2, value, sizeof(value));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=DeleteValue Key=\"%s\" Value=\"%s\"", key, value);
+    } else if (!strcmp(name, "NtRenameKey")) {
+        char key[88] = {};
+        char value[48] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        ReadUnicodeArgument(a2, value, sizeof(value));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Action=Rename Key=\"%s\" NewName=\"%s\"", key, value);
+    } else if (!strcmp(name, "NtDeleteKey")) {
+        char key[128] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Action=Delete Key=\"%s\"", key);
+    } else if (!strcmp(name, "NtQueryKey")) {
+        char key[104] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Key=\"%s\" Class=%u BufferSize=%u",
+            key, static_cast<ULONG>(a2), static_cast<ULONG>(a4));
+    } else if (!strcmp(name, "NtQueryValueKey")) {
+        char key[80] = {};
+        char value[48] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        ReadUnicodeArgument(a2, value, sizeof(value));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Key=\"%s\" Value=\"%s\" Class=%u",
+            key, value, static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtEnumerateKey") ||
+        !strcmp(name, "NtEnumerateValueKey")) {
+        char key[104] = {};
+        FormatHandleName(a1, key, sizeof(key));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Key=\"%s\" Index=%u Class=%u",
+            key, static_cast<ULONG>(a2), static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtOpenProcess")) {
+        CLIENT_ID client = {};
+        ULONG_PTR targetPid = 0;
+        char targetName[24] = "<unresolved>";
+        if (ReadUserValue(a4, &client)) {
+            targetPid = reinterpret_cast<ULONG_PTR>(client.UniqueProcess);
+            ResolveProcessId(client.UniqueProcess, &targetPid, targetName, sizeof(targetName));
         }
-    }
-    if (!entry) entry = &gHandleNames[gHandleNameNext++ & (HANDLE_NAME_ENTRIES - 1)];
-    entry->process = process;
-    entry->handle = handle;
-    entry->object = object;
-    RtlStringCbCopyA(entry->name, sizeof(entry->name), name);
-    KeReleaseSpinLock(&gHandleNameLock, oldIrql);
-    ObDereferenceObject(object);
-}
-
-static BOOLEAN FindHandleName(HANDLE handle, char* output, ULONG outputSize) {
-    output[0] = 0;
-    if (!handle || outputSize < 2) return FALSE;
-    PVOID object = nullptr;
-    if (!NT_SUCCESS(ObReferenceObjectByHandle(
-        handle, 0, nullptr, UserMode, &object, nullptr))) return FALSE;
-    PEPROCESS process = PsGetCurrentProcess();
-    BOOLEAN found = FALSE;
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&gHandleNameLock, &oldIrql);
-    for (ULONG i = 0; i < HANDLE_NAME_ENTRIES; ++i) {
-        if (gHandleNames[i].process == process && gHandleNames[i].handle == handle &&
-            gHandleNames[i].object == object) {
-            RtlStringCbCopyA(output, outputSize, gHandleNames[i].name);
-            found = TRUE;
-            break;
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "TargetPID=%llu TargetProcess=\"%s\" Access=0x%X",
+            targetPid, targetName, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtWriteVirtualMemory") ||
+        !strcmp(name, "NtReadVirtualMemory")) {
+        ULONG_PTR targetPid = 0;
+        char targetName[24] = "<unresolved>";
+        ResolveProcessHandle(reinterpret_cast<HANDLE>(a1), &targetPid,
+            targetName, sizeof(targetName));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "TargetHandle=0x%llX TargetPID=%llu TargetProcess=\"%s\" Base=0x%llX Size=%llu",
+            a1, targetPid, targetName, a2, a4);
+    } else if (!strcmp(name, "NtAllocateVirtualMemory") ||
+        !strcmp(name, "NtProtectVirtualMemory") || !strcmp(name, "NtFreeVirtualMemory")) {
+        ULONG_PTR targetPid = 0;
+        char targetName[24] = "<unresolved>";
+        ResolveProcessHandle(reinterpret_cast<HANDLE>(a1), &targetPid,
+            targetName, sizeof(targetName));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "TargetPID=%llu TargetProcess=\"%s\" BasePtr=0x%llX SizePtr=0x%llX Flags=0x%llX",
+            targetPid, targetName, a2, a3, a4);
+    } else if (!strcmp(name, "NtCreateFile") || !strcmp(name, "NtOpenFile")) {
+        char path[112] = {};
+        ReadObjectPath(reinterpret_cast<POBJECT_ATTRIBUTES>(a3), path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Path=\"%s\" Access=0x%X", path, static_cast<ULONG>(a2));
+    } else if (!strcmp(name, "NtQueryAttributesFile") ||
+        !strcmp(name, "NtQueryFullAttributesFile")) {
+        char path[136] = {};
+        ReadObjectPath(reinterpret_cast<POBJECT_ATTRIBUTES>(a1), path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail), "Path=\"%s\"", path);
+    } else if (!strcmp(name, "NtReadFile") || !strcmp(name, "NtWriteFile") ||
+        !strcmp(name, "NtQueryInformationFile") || !strcmp(name, "NtSetInformationFile") ||
+        !strcmp(name, "NtQueryDirectoryFile") || !strcmp(name, "NtQueryDirectoryFileEx") ||
+        !strcmp(name, "NtDeviceIoControlFile") || !strcmp(name, "NtFsControlFile")) {
+        char path[112] = {};
+        FormatHandleName(a1, path, sizeof(path));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "File=\"%s\" Arg2=0x%llX Arg3=0x%llX Arg4=0x%llX", path, a2, a3, a4);
+    } else if (!strcmp(name, "NtQuerySystemInformation")) {
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "Class=%u Buffer=0x%llX BufferSize=%u",
+            static_cast<ULONG>(a1), a2, static_cast<ULONG>(a3));
+    } else if (!strcmp(name, "NtOpenThread")) {
+        CLIENT_ID client = {};
+        if (ReadUserValue(a4, &client)) {
+            RtlStringCbPrintfA(detail, sizeof(detail),
+                "TargetPID=%llu TargetTID=%llu Access=0x%X",
+                reinterpret_cast<ULONG_PTR>(client.UniqueProcess),
+                reinterpret_cast<ULONG_PTR>(client.UniqueThread), static_cast<ULONG>(a2));
         }
+    } else if (!strcmp(name, "NtTerminateProcess") ||
+        !strcmp(name, "NtQueryInformationProcess") ||
+        !strcmp(name, "NtSetInformationProcess")) {
+        ULONG_PTR targetPid = 0;
+        char targetName[24] = "<unresolved>";
+        ResolveProcessHandle(reinterpret_cast<HANDLE>(a1), &targetPid,
+            targetName, sizeof(targetName));
+        RtlStringCbPrintfA(detail, sizeof(detail),
+            "TargetPID=%llu TargetProcess=\"%s\" Arg2=0x%llX Arg3=0x%llX Arg4=0x%llX",
+            targetPid, targetName, a2, a3, a4);
     }
-    KeReleaseSpinLock(&gHandleNameLock, oldIrql);
-    ObDereferenceObject(object);
-    return found;
+
+    EnqueueDetail(sequence, detail);
 }
 
-static void RememberReturnedHandle(PHANDLE returnedHandle, const char* name, NTSTATUS status) {
-    if (!NT_SUCCESS(status) || !returnedHandle || !name || !name[0]) return;
-    __try {
-        RememberHandleName(*returnedHandle, name);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-static void LogRawArguments(ULONG syscallId, const ULONG_PTR* arguments) {
+static void LogEntryArguments(ULONG syscallId, const ULONG_PTR* arguments) {
     ULONGLONG sequence = EnqueueEvent(syscallId, arguments);
-    if (sequence) {
-        USHORT category = gSyscallTable[syscallId].category;
-        if (category == ScallCategoryUser || category == ScallCategoryGraphics)
-            DecodeWin32kArguments(sequence, gSyscallTable[syscallId].name, arguments);
-    }
+    if (!sequence) return;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    USHORT category = gSyscallTable[syscallId].category;
+    if (category == ScallCategoryUser || category == ScallCategoryGraphics)
+        DecodeWin32kArguments(sequence, gSyscallTable[syscallId].name, arguments);
+    else
+        DecodeNativeArguments(sequence, gSyscallTable[syscallId].name, arguments);
 }
 
 static void __fastcall SyscallCallback(unsigned int syscallId, void** syscallFunction,
     ULONG_PTR* rawArguments) {
+    UNREFERENCED_PARAMETER(syscallFunction);
     if (gUnloading) return;
     if (syscallId >= gSyscallCount || !gSyscallTable[syscallId].name[0]) return;
     InterlockedIncrement(&gHooksActive);
-    PVOID detour = syscallId < SCALL_MAX_SYSCALLS ? gDetourFunctions[syscallId] : nullptr;
-    if (detour && gCaptureEnabled) {
-        ULONG pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId()));
-        ULONG excludedPid = static_cast<ULONG>(InterlockedCompareExchange(&gExcludedPid, 0, 0));
-        ULONG mask = static_cast<ULONG>(InterlockedCompareExchange(&gCategoryMask, 0, 0));
-        USHORT category = gSyscallTable[syscallId].category;
-        if (pid != excludedPid && MatchesTargetProcess(pid) && OperationEnabled(syscallId) &&
-            (mask & (1u << category))) {
-            ULONGLONG sequence = EnqueueEvent(syscallId, rawArguments);
-            if (!sequence) {
-                InterlockedDecrement(&gHooksActive);
-                return;
-            }
-            PVOID original = *syscallFunction;
-            if (!original || reinterpret_cast<ULONG_PTR>(original) <
-                reinterpret_cast<ULONG_PTR>(MmSystemRangeStart)) {
-                InterlockedDecrement(&gHooksActive);
-                return;
-            }
-            if (!gOriginalFunctions[syscallId])
-                InterlockedCompareExchangePointer(
-                    &gOriginalFunctions[syscallId], original, nullptr);
-            if (!gOriginalFunctions[syscallId]) {
-                InterlockedDecrement(&gHooksActive);
-                return;
-            }
-            if (!BeginImportant(sequence)) {
-                InterlockedDecrement(&gHooksActive);
-                return;
-            }
-            *syscallFunction = detour;
-            InterlockedDecrement(&gHooksActive);
-            return;
-        }
+    __try {
+        LogEntryArguments(syscallId, rawArguments);
     }
-    LogRawArguments(syscallId, rawArguments);
-    InterlockedDecrement(&gHooksActive);
-}
-
-struct SCALL_SIZE32 {
-    LONG width;
-    LONG height;
-};
-
-static LONG DetGdiExtTextOutW(PVOID hdc, LONG x, LONG y, ULONG options, PVOID rect,
-    PWCHAR text, LONG count, PLONG spacing, ULONG codePage) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char value[84] = {};
-        char bounds[48] = {};
-        if (count > 0) ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
-        ReadRect(reinterpret_cast<ULONG_PTR>(rect), bounds, sizeof(bounds));
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Hdc=0x%llX Pos=(%ld,%ld) Options=0x%X Rect=%s Text=\"%s\" CodePage=%u",
-            reinterpret_cast<ULONG_PTR>(hdc), x, y, options, bounds, value, codePage);
-        LogImportant(gIdxGdiExtTextOutW, detail);
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement64(&gDetailsDropped);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetGdiExtTextOutW)>(
-        gOriginalFunctions[gIdxGdiExtTextOutW]);
-    LONG result = original ? original(hdc, x, y, options, rect, text, count, spacing, codePage) : 0;
-    char outcome[32];
-    RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
-    LogCurrentOutcome(outcome);
     InterlockedDecrement(&gHooksActive);
-    return result;
 }
 
-static LONG DetGdiGetTextExtent(PVOID hdc, PWCHAR text, LONG count, PVOID size, ULONG options) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char value[112] = {};
-        if (count > 0) ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Hdc=0x%llX Text=\"%s\" Length=%ld Options=0x%X",
-            reinterpret_cast<ULONG_PTR>(hdc), value, count, options);
-        LogImportant(gIdxGdiGetTextExtent, detail);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetGdiGetTextExtent)>(
-        gOriginalFunctions[gIdxGdiGetTextExtent]);
-    LONG result = original ? original(hdc, text, count, size, options) : 0;
-    SCALL_SIZE32 extent = {};
-    char outcome[64];
-    if (result && ReadUserValue(reinterpret_cast<ULONG_PTR>(size), &extent))
-        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X Size=%ldx%ld",
-            static_cast<ULONG>(result), extent.width, extent.height);
-    else
-        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
-    LogCurrentOutcome(outcome);
-    InterlockedDecrement(&gHooksActive);
-    return result;
-}
-
-static LONG DetGdiGetTextExtentExW(PVOID hdc, PWCHAR text, ULONG count, ULONG maximum,
-    PULONG fitted, PULONG spacing, PVOID size, ULONG flags) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char value[104] = {};
-        ReadWideText(reinterpret_cast<ULONG_PTR>(text), count, value, sizeof(value));
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Hdc=0x%llX Text=\"%s\" Length=%u Maximum=%u Flags=0x%X",
-            reinterpret_cast<ULONG_PTR>(hdc), value, count, maximum, flags);
-        LogImportant(gIdxGdiGetTextExtentExW, detail);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetGdiGetTextExtentExW)>(
-        gOriginalFunctions[gIdxGdiGetTextExtentExW]);
-    LONG result = original ? original(hdc, text, count, maximum, fitted, spacing, size, flags) : 0;
-    ULONG characters = 0;
-    SCALL_SIZE32 extent = {};
-    BOOLEAN haveCharacters = ReadUserValue(reinterpret_cast<ULONG_PTR>(fitted), &characters);
-    BOOLEAN haveSize = ReadUserValue(reinterpret_cast<ULONG_PTR>(size), &extent);
-    char outcome[72];
-    if (result && haveSize) {
-        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X Size=%ldx%ld Fitted=%u",
-            static_cast<ULONG>(result), extent.width, extent.height,
-            haveCharacters ? characters : 0);
-    } else {
-        RtlStringCbPrintfA(outcome, sizeof(outcome), "0x%X", static_cast<ULONG>(result));
-    }
-    LogCurrentOutcome(outcome);
-    InterlockedDecrement(&gHooksActive);
-    return result;
-}
-
-static NTSTATUS DetCreateFile(PHANDLE file, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    PIO_STATUS_BLOCK io, PLARGE_INTEGER allocationSize, ULONG fileAttributes, ULONG shareAccess,
-    ULONG disposition, ULONG options, PVOID eaBuffer, ULONG eaLength) {
-    InterlockedIncrement(&gHooksActive);
-    char path[96] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Path=\"%s\" Access=0x%X Disposition=%u Options=0x%X", path, access, disposition, options);
-        LogImportant(gIdxCreateFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateFile)>(gOriginalFunctions[gIdxCreateFile]);
-    NTSTATUS status = original ? original(file, access, attributes, io, allocationSize, fileAttributes,
-        shareAccess, disposition, options, eaBuffer, eaLength) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(file, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenProcess(PHANDLE process, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes, PCLIENT_ID clientId) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        ULONG_PTR targetPid = clientId ? reinterpret_cast<ULONG_PTR>(clientId->UniqueProcess) : 0;
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail), "TargetPID=%llu Access=0x%X",
-            static_cast<ULONGLONG>(targetPid), access);
-        LogImportant(gIdxOpenProcess, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenProcess)>(gOriginalFunctions[gIdxOpenProcess]);
-    NTSTATUS status = original ? original(process, access, attributes, clientId) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetAllocateVirtualMemory(HANDLE process, PVOID* base, ULONG_PTR zeroBits,
-    PSIZE_T size, ULONG allocationType, ULONG protection) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        PVOID address = base ? *base : nullptr;
-        SIZE_T bytes = size ? *size : 0;
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Base=0x%llX Size=0x%llX Type=0x%X Protect=0x%X",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(address),
-            static_cast<ULONGLONG>(bytes), allocationType, protection);
-        LogImportant(gIdxAllocateVirtualMemory, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetAllocateVirtualMemory)>(
-        gOriginalFunctions[gIdxAllocateVirtualMemory]);
-    NTSTATUS status = original ? original(process, base, zeroBits, size, allocationType, protection)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetProtectVirtualMemory(HANDLE process, PVOID* base, PSIZE_T size,
-    ULONG protection, PULONG oldProtection) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        PVOID address = base ? *base : nullptr;
-        SIZE_T bytes = size ? *size : 0;
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Base=0x%llX Size=0x%llX NewProtect=0x%X",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(address),
-            static_cast<ULONGLONG>(bytes), protection);
-        LogImportant(gIdxProtectVirtualMemory, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetProtectVirtualMemory)>(
-        gOriginalFunctions[gIdxProtectVirtualMemory]);
-    NTSTATUS status = original ? original(process, base, size, protection, oldProtection)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetWriteVirtualMemory(HANDLE process, PVOID base, PVOID buffer,
-    SIZE_T size, PSIZE_T written) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Base=0x%llX Buffer=0x%llX Size=0x%llX",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(base),
-            reinterpret_cast<ULONGLONG>(buffer), static_cast<ULONGLONG>(size));
-        LogImportant(gIdxWriteVirtualMemory, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetWriteVirtualMemory)>(
-        gOriginalFunctions[gIdxWriteVirtualMemory]);
-    NTSTATUS status = original ? original(process, base, buffer, size, written)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateThreadEx(PHANDLE thread, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes, HANDLE process, PVOID startAddress, PVOID parameter,
-    ULONG flags, SIZE_T zeroBits, SIZE_T stackSize, SIZE_T maximumStackSize,
-    PVOID attributeList) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Start=0x%llX Parameter=0x%llX Access=0x%X Flags=0x%X",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(startAddress),
-            reinterpret_cast<ULONGLONG>(parameter), access, flags);
-        LogImportant(gIdxCreateThreadEx, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateThreadEx)>(
-        gOriginalFunctions[gIdxCreateThreadEx]);
-    NTSTATUS status = original ? original(thread, access, attributes, process, startAddress, parameter,
-        flags, zeroBits, stackSize, maximumStackSize, attributeList) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenKey(PHANDLE key, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[112] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Key=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenKey)>(gOriginalFunctions[gIdxOpenKey]);
-    NTSTATUS status = original ? original(key, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(key, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetSetValueKey(HANDLE key, PUNICODE_STRING valueName, ULONG titleIndex,
-    ULONG type, PVOID data, ULONG dataSize) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[72], keyPath[64];
-        char detail[160];
-        ReadUnicode(valueName, name, sizeof(name));
-        if (FindHandleName(key, keyPath, sizeof(keyPath)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "Key=\"%s\" Value=\"%s\" Type=%u Size=%u", keyPath, name, type, dataSize);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "KeyHandle=0x%llX Value=\"%s\" Type=%u Size=%u",
-                reinterpret_cast<ULONGLONG>(key), name, type, dataSize);
-        LogImportant(gIdxSetValueKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetSetValueKey)>(gOriginalFunctions[gIdxSetValueKey]);
-    NTSTATUS status = original ? original(key, valueName, titleIndex, type, data, dataSize)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenFile(PHANDLE file, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    PIO_STATUS_BLOCK io, ULONG shareAccess, ULONG options) {
-    InterlockedIncrement(&gHooksActive);
-    char path[104] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Path=\"%s\" Access=0x%X Share=0x%X Options=0x%X", path, access, shareAccess, options);
-        LogImportant(gIdxOpenFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenFile)>(gOriginalFunctions[gIdxOpenFile]);
-    NTSTATUS status = original ? original(file, access, attributes, io, shareAccess, options)
-                               : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(file, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryAttributesFile(POBJECT_ATTRIBUTES attributes, PVOID information) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[136], detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Path=\"%s\"", path);
-        LogImportant(gIdxQueryAttributesFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryAttributesFile)>(
-        gOriginalFunctions[gIdxQueryAttributesFile]);
-    NTSTATUS status = original ? original(attributes, information) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryFullAttributesFile(POBJECT_ATTRIBUTES attributes, PVOID information) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[136], detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Path=\"%s\"", path);
-        LogImportant(gIdxQueryFullAttributesFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryFullAttributesFile)>(
-        gOriginalFunctions[gIdxQueryFullAttributesFile]);
-    NTSTATUS status = original ? original(attributes, information) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryDirectoryFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, PVOID information, ULONG length, ULONG informationClass,
-    BOOLEAN singleEntry, PUNICODE_STRING fileName, BOOLEAN restartScan) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char pattern[64], filePath[64], detail[160];
-        ReadUnicode(fileName, pattern, sizeof(pattern));
-        if (FindHandleName(file, filePath, sizeof(filePath)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "Directory=\"%s\" Pattern=\"%s\" Class=%u Size=%u", filePath, pattern,
-                informationClass, length);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "FileHandle=0x%llX Pattern=\"%s\" Class=%u Size=%u",
-                reinterpret_cast<ULONGLONG>(file), pattern, informationClass, length);
-        LogImportant(gIdxQueryDirectoryFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryDirectoryFile)>(
-        gOriginalFunctions[gIdxQueryDirectoryFile]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, information, length,
-        informationClass, singleEntry, fileName, restartScan) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryDirectoryFileEx(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, PVOID information, ULONG length, ULONG informationClass,
-    ULONG flags, PUNICODE_STRING fileName) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char pattern[64], filePath[64], detail[160];
-        ReadUnicode(fileName, pattern, sizeof(pattern));
-        if (FindHandleName(file, filePath, sizeof(filePath)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "Directory=\"%s\" Pattern=\"%s\" Class=%u Flags=0x%X", filePath, pattern,
-                informationClass, flags);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "FileHandle=0x%llX Pattern=\"%s\" Class=%u Flags=0x%X",
-                reinterpret_cast<ULONGLONG>(file), pattern, informationClass, flags);
-        LogImportant(gIdxQueryDirectoryFileEx, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryDirectoryFileEx)>(
-        gOriginalFunctions[gIdxQueryDirectoryFileEx]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, information, length,
-        informationClass, flags, fileName) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetDeviceIoControlFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, ULONG controlCode, PVOID input, ULONG inputLength, PVOID output,
-    ULONG outputLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char filePath[80], detail[160];
-        if (FindHandleName(file, filePath, sizeof(filePath)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "File=\"%s\" IOCTL=0x%08X InputSize=%u OutputSize=%u",
-                filePath, controlCode, inputLength, outputLength);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "FileHandle=0x%llX IOCTL=0x%08X InputSize=%u OutputSize=%u",
-                reinterpret_cast<ULONGLONG>(file), controlCode, inputLength, outputLength);
-        LogImportant(gIdxDeviceIoControlFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetDeviceIoControlFile)>(
-        gOriginalFunctions[gIdxDeviceIoControlFile]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, controlCode, input,
-        inputLength, output, outputLength) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenKeyEx(PHANDLE key, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    ULONG options) {
-    InterlockedIncrement(&gHooksActive);
-    char path[104] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Key=\"%s\" Access=0x%X Options=0x%X",
-            path, access, options);
-        LogImportant(gIdxOpenKeyEx, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenKeyEx)>(gOriginalFunctions[gIdxOpenKeyEx]);
-    NTSTATUS status = original ? original(key, access, attributes, options) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(key, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateKey(PHANDLE key, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    ULONG titleIndex, PUNICODE_STRING keyClass, ULONG options, PULONG disposition) {
-    InterlockedIncrement(&gHooksActive);
-    char path[88] = {};
-    __try {
-        char className[40], detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        ReadUnicode(keyClass, className, sizeof(className));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Key=\"%s\" Class=\"%s\" Access=0x%X Options=0x%X", path, className, access, options);
-        LogImportant(gIdxCreateKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateKey)>(gOriginalFunctions[gIdxCreateKey]);
-    NTSTATUS status = original ? original(key, access, attributes, titleIndex, keyClass, options,
-        disposition) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(key, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryValueKey(HANDLE key, PUNICODE_STRING valueName, ULONG informationClass,
-    PVOID information, ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[72], keyPath[64], detail[160];
-        ReadUnicode(valueName, name, sizeof(name));
-        if (FindHandleName(key, keyPath, sizeof(keyPath)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "Key=\"%s\" Value=\"%s\" Class=%u BufferSize=%u",
-                keyPath, name, informationClass, length);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "KeyHandle=0x%llX Value=\"%s\" Class=%u BufferSize=%u",
-                reinterpret_cast<ULONGLONG>(key), name, informationClass, length);
-        LogImportant(gIdxQueryValueKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryValueKey)>(
-        gOriginalFunctions[gIdxQueryValueKey]);
-    NTSTATUS status = original ? original(key, valueName, informationClass, information, length,
-        resultLength) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetDeleteValueKey(HANDLE key, PUNICODE_STRING valueName) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[72], keyPath[64], detail[160];
-        ReadUnicode(valueName, name, sizeof(name));
-        if (FindHandleName(key, keyPath, sizeof(keyPath)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "Key=\"%s\" Value=\"%s\"", keyPath, name);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "KeyHandle=0x%llX Value=\"%s\"",
-                reinterpret_cast<ULONGLONG>(key), name);
-        LogImportant(gIdxDeleteValueKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetDeleteValueKey)>(
-        gOriginalFunctions[gIdxDeleteValueKey]);
-    NTSTATUS status = original ? original(key, valueName) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetRenameKey(HANDLE key, PUNICODE_STRING newName) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[72], keyPath[64], detail[160];
-        ReadUnicode(newName, name, sizeof(name));
-        if (FindHandleName(key, keyPath, sizeof(keyPath)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "Key=\"%s\" NewName=\"%s\"", keyPath, name);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "KeyHandle=0x%llX NewName=\"%s\"",
-                reinterpret_cast<ULONGLONG>(key), name);
-        LogImportant(gIdxRenameKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetRenameKey)>(gOriginalFunctions[gIdxRenameKey]);
-    NTSTATUS status = original ? original(key, newName) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenSection(PHANDLE section, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[112] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Section=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenSection, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenSection)>(gOriginalFunctions[gIdxOpenSection]);
-    NTSTATUS status = original ? original(section, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(section, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateEvent(PHANDLE event, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    EVENT_TYPE type, BOOLEAN initialState) {
-    InterlockedIncrement(&gHooksActive);
-    char path[96] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Event=\"%s\" Access=0x%X Type=%u InitialState=%u", path, access,
-            static_cast<ULONG>(type), static_cast<ULONG>(initialState));
-        LogImportant(gIdxCreateEvent, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateEvent)>(gOriginalFunctions[gIdxCreateEvent]);
-    NTSTATUS status = original ? original(event, access, attributes, type, initialState)
-                               : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(event, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenEvent(PHANDLE event, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[112] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Event=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenEvent, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenEvent)>(gOriginalFunctions[gIdxOpenEvent]);
-    NTSTATUS status = original ? original(event, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(event, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateMutant(PHANDLE mutant, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes, BOOLEAN initialOwner) {
-    InterlockedIncrement(&gHooksActive);
-    char path[96] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Mutant=\"%s\" Access=0x%X InitialOwner=%u", path, access,
-            static_cast<ULONG>(initialOwner));
-        LogImportant(gIdxCreateMutant, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateMutant)>(
-        gOriginalFunctions[gIdxCreateMutant]);
-    NTSTATUS status = original ? original(mutant, access, attributes, initialOwner)
-                               : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(mutant, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenMutant(PHANDLE mutant, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[112] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Mutant=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenMutant, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenMutant)>(gOriginalFunctions[gIdxOpenMutant]);
-    NTSTATUS status = original ? original(mutant, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(mutant, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateSemaphore(PHANDLE semaphore, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes, LONG initialCount, LONG maximumCount) {
-    InterlockedIncrement(&gHooksActive);
-    char path[88] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Semaphore=\"%s\" Access=0x%X Initial=%ld Maximum=%ld", path, access,
-            initialCount, maximumCount);
-        LogImportant(gIdxCreateSemaphore, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateSemaphore)>(
-        gOriginalFunctions[gIdxCreateSemaphore]);
-    NTSTATUS status = original ? original(semaphore, access, attributes, initialCount, maximumCount)
-                               : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(semaphore, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenSemaphore(PHANDLE semaphore, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[104] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Semaphore=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenSemaphore, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenSemaphore)>(
-        gOriginalFunctions[gIdxOpenSemaphore]);
-    NTSTATUS status = original ? original(semaphore, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(semaphore, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetCreateTimer(PHANDLE timer, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    TIMER_TYPE type) {
-    InterlockedIncrement(&gHooksActive);
-    char path[96] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Timer=\"%s\" Access=0x%X Type=%u", path,
-            access, static_cast<ULONG>(type));
-        LogImportant(gIdxCreateTimer, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetCreateTimer)>(gOriginalFunctions[gIdxCreateTimer]);
-    NTSTATUS status = original ? original(timer, access, attributes, type) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(timer, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenDirectoryObject(PHANDLE directory, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[104] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Directory=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenDirectoryObject, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenDirectoryObject)>(
-        gOriginalFunctions[gIdxOpenDirectoryObject]);
-    NTSTATUS status = original ? original(directory, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(directory, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenSymbolicLinkObject(PHANDLE link, ACCESS_MASK access,
-    POBJECT_ATTRIBUTES attributes) {
-    InterlockedIncrement(&gHooksActive);
-    char path[104] = {};
-    __try {
-        char detail[160];
-        ReadObjectPath(attributes, path, sizeof(path));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Link=\"%s\" Access=0x%X", path, access);
-        LogImportant(gIdxOpenSymbolicLinkObject, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenSymbolicLinkObject)>(
-        gOriginalFunctions[gIdxOpenSymbolicLinkObject]);
-    NTSTATUS status = original ? original(link, access, attributes) : STATUS_NOT_IMPLEMENTED;
-    RememberReturnedHandle(link, path, status);
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetConnectPort(PHANDLE port, PUNICODE_STRING portName, PVOID securityQos,
-    PVOID clientView, PVOID serverView, PULONG maximumMessageLength, PVOID connectionInfo,
-    PULONG connectionInfoLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[112], detail[160];
-        ReadUnicode(portName, name, sizeof(name));
-        ULONG bytes = connectionInfoLength ? *connectionInfoLength : 0;
-        RtlStringCbPrintfA(detail, sizeof(detail), "Port=\"%s\" ConnectionInfoSize=%u", name, bytes);
-        LogImportant(gIdxConnectPort, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetConnectPort)>(gOriginalFunctions[gIdxConnectPort]);
-    NTSTATUS status = original ? original(port, portName, securityQos, clientView, serverView,
-        maximumMessageLength, connectionInfo, connectionInfoLength) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetSecureConnectPort(PHANDLE port, PUNICODE_STRING portName, PVOID securityQos,
-    PVOID clientView, PVOID requiredServerSid, PVOID serverView, PULONG maximumMessageLength,
-    PVOID connectionInfo, PULONG connectionInfoLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[112], detail[160];
-        ReadUnicode(portName, name, sizeof(name));
-        ULONG bytes = connectionInfoLength ? *connectionInfoLength : 0;
-        RtlStringCbPrintfA(detail, sizeof(detail), "Port=\"%s\" ConnectionInfoSize=%u", name, bytes);
-        LogImportant(gIdxSecureConnectPort, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetSecureConnectPort)>(
-        gOriginalFunctions[gIdxSecureConnectPort]);
-    NTSTATUS status = original ? original(port, portName, securityQos, clientView,
-        requiredServerSid, serverView, maximumMessageLength, connectionInfo, connectionInfoLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetAlpcConnectPort(PHANDLE port, PUNICODE_STRING portName,
-    POBJECT_ATTRIBUTES attributes, PVOID portAttributes, ULONG flags, PVOID requiredServerSid,
-    PVOID connectionMessage, PSIZE_T bufferLength, PVOID outputMessageAttributes,
-    PVOID inputMessageAttributes, PVOID timeout) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[104], detail[160];
-        ReadUnicode(portName, name, sizeof(name));
-        SIZE_T bytes = bufferLength ? *bufferLength : 0;
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Port=\"%s\" Flags=0x%X MessageSize=%llu", name, flags,
-            static_cast<ULONGLONG>(bytes));
-        LogImportant(gIdxAlpcConnectPort, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetAlpcConnectPort)>(
-        gOriginalFunctions[gIdxAlpcConnectPort]);
-    NTSTATUS status = original ? original(port, portName, attributes, portAttributes, flags,
-        requiredServerSid, connectionMessage, bufferLength, outputMessageAttributes,
-        inputMessageAttributes, timeout) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetAlpcConnectPortEx(PHANDLE port, POBJECT_ATTRIBUTES connectionAttributes,
-    POBJECT_ATTRIBUTES serverAttributes, PVOID portAttributes, ULONG flags,
-    PVOID serverSecurityRequirements, PVOID connectionMessage, PSIZE_T bufferLength,
-    PVOID outputMessageAttributes, PVOID inputMessageAttributes, PVOID timeout) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char connection[72], server[48], detail[160];
-        ReadObjectPath(connectionAttributes, connection, sizeof(connection));
-        ReadObjectPath(serverAttributes, server, sizeof(server));
-        SIZE_T bytes = bufferLength ? *bufferLength : 0;
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Connection=\"%s\" Server=\"%s\" Flags=0x%X MessageSize=%llu", connection,
-            server, flags, static_cast<ULONGLONG>(bytes));
-        LogImportant(gIdxAlpcConnectPortEx, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetAlpcConnectPortEx)>(
-        gOriginalFunctions[gIdxAlpcConnectPortEx]);
-    NTSTATUS status = original ? original(port, connectionAttributes, serverAttributes,
-        portAttributes, flags, serverSecurityRequirements, connectionMessage, bufferLength,
-        outputMessageAttributes, inputMessageAttributes, timeout) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetLoadDriver(PUNICODE_STRING serviceName) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[136], detail[160];
-        ReadUnicode(serviceName, name, sizeof(name));
-        RtlStringCbPrintfA(detail, sizeof(detail), "Service=\"%s\"", name);
-        LogImportant(gIdxLoadDriver, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetLoadDriver)>(gOriginalFunctions[gIdxLoadDriver]);
-    NTSTATUS status = original ? original(serviceName) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetReadFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, PVOID buffer, ULONG length, PVOID offset, PVOID key) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[96], detail[160];
-        if (FindHandleName(file, path, sizeof(path)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "File=\"%s\" Size=%u", path, length);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "FileHandle=0x%llX Size=%u",
-                reinterpret_cast<ULONGLONG>(file), length);
-        LogImportant(gIdxReadFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetReadFile)>(gOriginalFunctions[gIdxReadFile]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, buffer, length, offset, key)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetWriteFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, PVOID buffer, ULONG length, PVOID offset, PVOID key) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[96], detail[160];
-        if (FindHandleName(file, path, sizeof(path)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "File=\"%s\" Size=%u", path, length);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "FileHandle=0x%llX Size=%u",
-                reinterpret_cast<ULONGLONG>(file), length);
-        LogImportant(gIdxWriteFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetWriteFile)>(gOriginalFunctions[gIdxWriteFile]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, buffer, length, offset, key)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static void LogFileInformation(ULONG syscallId, HANDLE file, ULONG informationClass, ULONG length) {
-    char path[88], detail[160];
-    if (FindHandleName(file, path, sizeof(path)))
-        RtlStringCbPrintfA(detail, sizeof(detail), "File=\"%s\" Class=%u BufferSize=%u",
-            path, informationClass, length);
-    else
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "FileHandle=0x%llX Class=%u BufferSize=%u",
-            reinterpret_cast<ULONGLONG>(file), informationClass, length);
-    LogImportant(syscallId, detail);
-}
-
-static NTSTATUS DetQueryInformationFile(HANDLE file, PIO_STATUS_BLOCK io, PVOID information,
-    ULONG length, ULONG informationClass) {
-    InterlockedIncrement(&gHooksActive);
-    __try { LogFileInformation(gIdxQueryInformationFile, file, informationClass, length); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryInformationFile)>(
-        gOriginalFunctions[gIdxQueryInformationFile]);
-    NTSTATUS status = original ? original(file, io, information, length, informationClass)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetSetInformationFile(HANDLE file, PIO_STATUS_BLOCK io, PVOID information,
-    ULONG length, ULONG informationClass) {
-    InterlockedIncrement(&gHooksActive);
-    __try { LogFileInformation(gIdxSetInformationFile, file, informationClass, length); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetSetInformationFile)>(
-        gOriginalFunctions[gIdxSetInformationFile]);
-    NTSTATUS status = original ? original(file, io, information, length, informationClass)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetFsControlFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcContext,
-    PIO_STATUS_BLOCK io, ULONG controlCode, PVOID input, ULONG inputLength, PVOID output,
-    ULONG outputLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[72], detail[160];
-        if (FindHandleName(file, path, sizeof(path)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "File=\"%s\" FSCTL=0x%08X InputSize=%u OutputSize=%u",
-                path, controlCode, inputLength, outputLength);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "FileHandle=0x%llX FSCTL=0x%08X InputSize=%u OutputSize=%u",
-                reinterpret_cast<ULONGLONG>(file), controlCode, inputLength, outputLength);
-        LogImportant(gIdxFsControlFile, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetFsControlFile)>(
-        gOriginalFunctions[gIdxFsControlFile]);
-    NTSTATUS status = original ? original(file, event, apc, apcContext, io, controlCode, input,
-        inputLength, output, outputLength) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static void LogKeyInformation(ULONG syscallId, HANDLE key, const char* operation,
-    ULONG index, ULONG informationClass, ULONG length) {
-    char path[72], detail[160];
-    if (FindHandleName(key, path, sizeof(path)))
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Key=\"%s\" %s Index=%u Class=%u BufferSize=%u",
-            path, operation, index, informationClass, length);
-    else
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "KeyHandle=0x%llX %s Index=%u Class=%u BufferSize=%u",
-            reinterpret_cast<ULONGLONG>(key), operation, index, informationClass, length);
-    LogImportant(syscallId, detail);
-}
-
-static NTSTATUS DetQueryKey(HANDLE key, ULONG informationClass, PVOID information,
-    ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try { LogKeyInformation(gIdxQueryKey, key, "Query", 0, informationClass, length); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryKey)>(gOriginalFunctions[gIdxQueryKey]);
-    NTSTATUS status = original ? original(key, informationClass, information, length, resultLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetDeleteKey(HANDLE key) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char path[112], detail[160];
-        if (FindHandleName(key, path, sizeof(path)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "Key=\"%s\"", path);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "KeyHandle=0x%llX",
-                reinterpret_cast<ULONGLONG>(key));
-        LogImportant(gIdxDeleteKey, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetDeleteKey)>(gOriginalFunctions[gIdxDeleteKey]);
-    NTSTATUS status = original ? original(key) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetEnumerateKey(HANDLE key, ULONG index, ULONG informationClass,
-    PVOID information, ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try { LogKeyInformation(gIdxEnumerateKey, key, "Enumerate", index, informationClass, length); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetEnumerateKey)>(gOriginalFunctions[gIdxEnumerateKey]);
-    NTSTATUS status = original ? original(key, index, informationClass, information, length, resultLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetEnumerateValueKey(HANDLE key, ULONG index, ULONG informationClass,
-    PVOID information, ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try { LogKeyInformation(gIdxEnumerateValueKey, key, "EnumerateValue", index, informationClass, length); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetEnumerateValueKey)>(
-        gOriginalFunctions[gIdxEnumerateValueKey]);
-    NTSTATUS status = original ? original(key, index, informationClass, information, length, resultLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetFreeVirtualMemory(HANDLE process, PVOID* base, PSIZE_T size, ULONG freeType) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        PVOID address = base ? *base : nullptr;
-        SIZE_T bytes = size ? *size : 0;
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Base=0x%llX Size=0x%llX FreeType=0x%X",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(address),
-            static_cast<ULONGLONG>(bytes), freeType);
-        LogImportant(gIdxFreeVirtualMemory, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetFreeVirtualMemory)>(
-        gOriginalFunctions[gIdxFreeVirtualMemory]);
-    NTSTATUS status = original ? original(process, base, size, freeType) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetReadVirtualMemory(HANDLE process, PVOID address, PVOID buffer,
-    SIZE_T size, PSIZE_T bytesRead) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Address=0x%llX Size=0x%llX",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(address),
-            static_cast<ULONGLONG>(size));
-        LogImportant(gIdxReadVirtualMemory, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetReadVirtualMemory)>(
-        gOriginalFunctions[gIdxReadVirtualMemory]);
-    NTSTATUS status = original ? original(process, address, buffer, size, bytesRead)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetMapViewOfSection(HANDLE section, HANDLE process, PVOID* base,
-    ULONG_PTR zeroBits, SIZE_T commitSize, PVOID offset, PSIZE_T viewSize, ULONG inherit,
-    ULONG allocationType, ULONG protection) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        PVOID address = base ? *base : nullptr;
-        SIZE_T bytes = viewSize ? *viewSize : 0;
-        char sectionName[56], detail[160];
-        if (FindHandleName(section, sectionName, sizeof(sectionName)))
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "Section=\"%s\" Process=0x%llX Base=0x%llX Size=0x%llX Protect=0x%X",
-                sectionName, reinterpret_cast<ULONGLONG>(process),
-                reinterpret_cast<ULONGLONG>(address), static_cast<ULONGLONG>(bytes), protection);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail),
-                "SectionHandle=0x%llX Process=0x%llX Base=0x%llX Size=0x%llX Protect=0x%X",
-                reinterpret_cast<ULONGLONG>(section), reinterpret_cast<ULONGLONG>(process),
-                reinterpret_cast<ULONGLONG>(address), static_cast<ULONGLONG>(bytes), protection);
-        LogImportant(gIdxMapViewOfSection, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetMapViewOfSection)>(
-        gOriginalFunctions[gIdxMapViewOfSection]);
-    NTSTATUS status = original ? original(section, process, base, zeroBits, commitSize, offset,
-        viewSize, inherit, allocationType, protection) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetUnmapViewOfSection(HANDLE process, PVOID base) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[128];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Process=0x%llX Base=0x%llX",
-            reinterpret_cast<ULONGLONG>(process), reinterpret_cast<ULONGLONG>(base));
-        LogImportant(gIdxUnmapViewOfSection, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetUnmapViewOfSection)>(
-        gOriginalFunctions[gIdxUnmapViewOfSection]);
-    NTSTATUS status = original ? original(process, base) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetTerminateProcess(HANDLE process, NTSTATUS exitStatus) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[128];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Process=0x%llX ExitStatus=0x%08X",
-            reinterpret_cast<ULONGLONG>(process), static_cast<ULONG>(exitStatus));
-        LogImportant(gIdxTerminateProcess, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetTerminateProcess)>(
-        gOriginalFunctions[gIdxTerminateProcess]);
-    NTSTATUS status = original ? original(process, exitStatus) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueryInformationProcess(HANDLE process, ULONG informationClass,
-    PVOID information, ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Class=%u BufferSize=%u",
-            reinterpret_cast<ULONGLONG>(process), informationClass, length);
-        LogImportant(gIdxQueryInformationProcess, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueryInformationProcess)>(
-        gOriginalFunctions[gIdxQueryInformationProcess]);
-    NTSTATUS status = original ? original(process, informationClass, information, length, resultLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetSetInformationProcess(HANDLE process, ULONG informationClass,
-    PVOID information, ULONG length) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Process=0x%llX Class=%u BufferSize=%u",
-            reinterpret_cast<ULONGLONG>(process), informationClass, length);
-        LogImportant(gIdxSetInformationProcess, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetSetInformationProcess)>(
-        gOriginalFunctions[gIdxSetInformationProcess]);
-    NTSTATUS status = original ? original(process, informationClass, information, length)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenThread(PHANDLE thread, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
-    PCLIENT_ID clientId) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        ULONG_PTR pid = clientId ? reinterpret_cast<ULONG_PTR>(clientId->UniqueProcess) : 0;
-        ULONG_PTR tid = clientId ? reinterpret_cast<ULONG_PTR>(clientId->UniqueThread) : 0;
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail), "TargetPID=%llu TargetTID=%llu Access=0x%X",
-            static_cast<ULONGLONG>(pid), static_cast<ULONGLONG>(tid), access);
-        LogImportant(gIdxOpenThread, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenThread)>(gOriginalFunctions[gIdxOpenThread]);
-    NTSTATUS status = original ? original(thread, access, attributes, clientId)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetSuspendThread(HANDLE thread, PULONG previousCount) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[96];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Thread=0x%llX",
-            reinterpret_cast<ULONGLONG>(thread));
-        LogImportant(gIdxSuspendThread, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetSuspendThread)>(gOriginalFunctions[gIdxSuspendThread]);
-    NTSTATUS status = original ? original(thread, previousCount) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetResumeThread(HANDLE thread, PULONG previousCount) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[96];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Thread=0x%llX",
-            reinterpret_cast<ULONGLONG>(thread));
-        LogImportant(gIdxResumeThread, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetResumeThread)>(gOriginalFunctions[gIdxResumeThread]);
-    NTSTATUS status = original ? original(thread, previousCount) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQueueApcThread(HANDLE thread, PVOID routine, PVOID argument1,
-    PVOID argument2, PVOID argument3) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[160];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Thread=0x%llX Routine=0x%llX Arg1=0x%llX Arg2=0x%llX Arg3=0x%llX",
-            reinterpret_cast<ULONGLONG>(thread), reinterpret_cast<ULONGLONG>(routine),
-            reinterpret_cast<ULONGLONG>(argument1), reinterpret_cast<ULONGLONG>(argument2),
-            reinterpret_cast<ULONGLONG>(argument3));
-        LogImportant(gIdxQueueApcThread, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQueueApcThread)>(
-        gOriginalFunctions[gIdxQueueApcThread]);
-    NTSTATUS status = original ? original(thread, routine, argument1, argument2, argument3)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenProcessToken(HANDLE process, ACCESS_MASK access, PHANDLE token) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[112];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Process=0x%llX Access=0x%X",
-            reinterpret_cast<ULONGLONG>(process), access);
-        LogImportant(gIdxOpenProcessToken, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenProcessToken)>(
-        gOriginalFunctions[gIdxOpenProcessToken]);
-    NTSTATUS status = original ? original(process, access, token) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetOpenThreadTokenEx(HANDLE thread, ACCESS_MASK access, BOOLEAN openAsSelf,
-    ULONG handleAttributes, PHANDLE token) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Thread=0x%llX Access=0x%X OpenAsSelf=%u Attributes=0x%X",
-            reinterpret_cast<ULONGLONG>(thread), access, static_cast<ULONG>(openAsSelf),
-            handleAttributes);
-        LogImportant(gIdxOpenThreadTokenEx, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetOpenThreadTokenEx)>(
-        gOriginalFunctions[gIdxOpenThreadTokenEx]);
-    NTSTATUS status = original ? original(thread, access, openAsSelf, handleAttributes, token)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetAdjustPrivilegesToken(HANDLE token, BOOLEAN disableAll, PVOID newState,
-    ULONG bufferLength, PVOID previousState, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Token=0x%llX DisableAll=%u StateSize=%u",
-            reinterpret_cast<ULONGLONG>(token), static_cast<ULONG>(disableAll), bufferLength);
-        LogImportant(gIdxAdjustPrivilegesToken, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetAdjustPrivilegesToken)>(
-        gOriginalFunctions[gIdxAdjustPrivilegesToken]);
-    NTSTATUS status = original ? original(token, disableAll, newState, bufferLength,
-        previousState, resultLength) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetReleaseMutant(HANDLE mutant, PULONG previousCount) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char name[112], detail[160];
-        if (FindHandleName(mutant, name, sizeof(name)))
-            RtlStringCbPrintfA(detail, sizeof(detail), "Mutant=\"%s\"", name);
-        else
-            RtlStringCbPrintfA(detail, sizeof(detail), "MutantHandle=0x%llX",
-                reinterpret_cast<ULONGLONG>(mutant));
-        LogImportant(gIdxReleaseMutant, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetReleaseMutant)>(
-        gOriginalFunctions[gIdxReleaseMutant]);
-    NTSTATUS status = original ? original(mutant, previousCount) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetAlpcSendWaitReceivePort(HANDLE port, ULONG flags, PVOID sendMessage,
-    PVOID sendAttributes, PVOID receiveMessage, PSIZE_T receiveLength,
-    PVOID receiveAttributes, PVOID timeout) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        SIZE_T bytes = receiveLength ? *receiveLength : 0;
-        char detail[144];
-        RtlStringCbPrintfA(detail, sizeof(detail),
-            "Port=0x%llX Flags=0x%X ReceiveBufferSize=%llu Send=%u Receive=%u",
-            reinterpret_cast<ULONGLONG>(port), flags, static_cast<ULONGLONG>(bytes),
-            sendMessage ? 1u : 0u, receiveMessage ? 1u : 0u);
-        LogImportant(gIdxAlpcSendWaitReceivePort, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetAlpcSendWaitReceivePort)>(
-        gOriginalFunctions[gIdxAlpcSendWaitReceivePort]);
-    NTSTATUS status = original ? original(port, flags, sendMessage, sendAttributes,
-        receiveMessage, receiveLength, receiveAttributes, timeout) : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
-
-static NTSTATUS DetQuerySystemInformation(ULONG informationClass, PVOID information,
-    ULONG length, PULONG resultLength) {
-    InterlockedIncrement(&gHooksActive);
-    __try {
-        char detail[112];
-        RtlStringCbPrintfA(detail, sizeof(detail), "Class=%u BufferSize=%u",
-            informationClass, length);
-        LogImportant(gIdxQuerySystemInformation, detail);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    auto original = reinterpret_cast<decltype(&DetQuerySystemInformation)>(
-        gOriginalFunctions[gIdxQuerySystemInformation]);
-    NTSTATUS status = original ? original(informationClass, information, length, resultLength)
-                               : STATUS_NOT_IMPLEMENTED;
-    LogCurrentResult(status);
-    InterlockedDecrement(&gHooksActive);
-    return status;
-}
 
 static NTSTATUS CompleteIrp(PIRP irp, NTSTATUS status, ULONG_PTR information) {
     irp->IoStatus.Status = status;
@@ -2551,6 +1113,47 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp) {
             if (old != config->operation_mask[i]) filtersChanged = TRUE;
         }
         InterlockedExchange(&gOperationFilterUpdating, 0);
+        ULONG requestedRuleCount = min(config->argument_rule_count, SCALL_MAX_ARGUMENT_RULES);
+        LONG oldRuleCount = InterlockedCompareExchange(&gArgumentRuleCount, 0, 0);
+        InterlockedExchange(&gArgumentFilterUpdating, 1);
+        for (ULONG i = 0; i < SCALL_OPERATION_MASK_WORDS; ++i)
+            InterlockedExchange(&gArgumentRuleOperationMask[i], 0);
+        ULONG acceptedRuleCount = 0;
+        for (ULONG i = 0; i < requestedRuleCount; ++i) {
+            const auto& inputRule = config->argument_rules[i];
+            if (inputRule.syscall_id >= SCALL_MAX_SYSCALLS ||
+                (inputRule.action != SCALL_ARGUMENT_RULE_EXCEPT &&
+                 inputRule.action != SCALL_ARGUMENT_RULE_ONLY) ||
+                inputRule.condition_count == 0 ||
+                inputRule.condition_count > SCALL_MAX_RULE_CONDITIONS) {
+                continue;
+            }
+            BOOLEAN valid = TRUE;
+            for (ULONG conditionIndex = 0; conditionIndex < inputRule.condition_count;
+                 ++conditionIndex) {
+                if (inputRule.conditions[conditionIndex].argument_index >=
+                    SCALL_MAX_RULE_CONDITIONS) {
+                    valid = FALSE;
+                    break;
+                }
+            }
+            if (!valid) continue;
+            if (acceptedRuleCount >= static_cast<ULONG>(oldRuleCount) ||
+                RtlCompareMemory(&gArgumentRules[acceptedRuleCount], &inputRule,
+                    sizeof(inputRule)) != sizeof(inputRule)) {
+                filtersChanged = TRUE;
+            }
+            gArgumentRules[acceptedRuleCount++] = inputRule;
+            ULONG word = inputRule.syscall_id / 32;
+            ULONG bit = inputRule.syscall_id % 32;
+            InterlockedOr(&gArgumentRuleOperationMask[word], static_cast<LONG>(1u << bit));
+        }
+        for (ULONG i = acceptedRuleCount; i < SCALL_MAX_ARGUMENT_RULES; ++i)
+            RtlZeroMemory(&gArgumentRules[i], sizeof(gArgumentRules[i]));
+        InterlockedExchange(&gArgumentRuleCount, static_cast<LONG>(acceptedRuleCount));
+        InterlockedExchange(&gArgumentFilterUpdating, 0);
+        if (oldRuleCount != static_cast<LONG>(acceptedRuleCount))
+            filtersChanged = TRUE;
         InterlockedExchange(&gCategoryMask, static_cast<LONG>(config->category_mask & SCALL_ALL_CATEGORIES));
         InterlockedExchange(&gCaptureEnabled, config->capture_enabled ? 1 : 0);
         InterlockedExchange(&gExcludedPid, static_cast<LONG>(config->excluded_pid));
@@ -2662,8 +1265,6 @@ static NTSTATUS InitializeMonitorDriver(
     PUNICODE_STRING registryPath) {
     UNREFERENCED_PARAMETER(registryPath);
     KeInitializeSpinLock(&gRingLock);
-    KeInitializeSpinLock(&gHandleNameLock);
-    KeInitializeSpinLock(&gResultLock);
     gRing = static_cast<SCALL_EVENT*>(ExAllocatePool2(
         POOL_FLAG_NON_PAGED, static_cast<SIZE_T>(LOG_RING_ENTRIES) * sizeof(SCALL_EVENT), POOL_TAG));
     if (!gRing) return STATUS_INSUFFICIENT_RESOURCES;

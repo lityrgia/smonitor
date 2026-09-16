@@ -9,13 +9,18 @@
 #define SCALL_IOCTL_GET_TABLE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_OUT_DIRECT, FILE_READ_DATA)
 #define SCALL_IOCTL_READ_DETAILS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_OUT_DIRECT, FILE_READ_DATA)
 
-#define SCALL_PROTOCOL_VERSION 10u
+#define SCALL_PROTOCOL_VERSION 11u
 #define SCALL_MAX_SYSCALLS 0x2000u
 #define SCALL_MAX_TARGET_PIDS 16u
 #define SCALL_MAX_TARGET_NAMES 16u
 #define SCALL_PROCESS_NAME_BYTES 16u
 #define SCALL_OPERATION_MASK_WORDS (SCALL_MAX_SYSCALLS / 32u)
+#define SCALL_MAX_ARGUMENT_RULES 128u
+#define SCALL_MAX_RULE_CONDITIONS 4u
 #define SCALL_EVENT_FLAG_ARGUMENTS_VALID 0x1u
+
+#define SCALL_ARGUMENT_RULE_EXCEPT 1u
+#define SCALL_ARGUMENT_RULE_ONLY 2u
 
 enum SCALL_CATEGORY : unsigned short {
     ScallCategoryFile = 0,
@@ -46,6 +51,20 @@ struct SCALL_EVENT {
     char process_name[SCALL_PROCESS_NAME_BYTES];
 };
 
+struct SCALL_ARGUMENT_CONDITION {
+    unsigned char argument_index;
+    unsigned char reserved[7];
+    unsigned long long value;
+};
+
+struct SCALL_ARGUMENT_RULE {
+    unsigned short syscall_id;
+    unsigned char action;
+    unsigned char condition_count;
+    unsigned long reserved;
+    SCALL_ARGUMENT_CONDITION conditions[SCALL_MAX_RULE_CONDITIONS];
+};
+
 struct SCALL_CONFIG {
     unsigned long version;
     unsigned long category_mask;
@@ -56,6 +75,9 @@ struct SCALL_CONFIG {
     unsigned long target_name_count;
     char target_names[SCALL_MAX_TARGET_NAMES][SCALL_PROCESS_NAME_BYTES];
     unsigned long operation_mask[SCALL_OPERATION_MASK_WORDS];
+    unsigned long argument_rule_count;
+    unsigned long reserved;
+    SCALL_ARGUMENT_RULE argument_rules[SCALL_MAX_ARGUMENT_RULES];
 };
 
 struct SCALL_STATS {
@@ -79,6 +101,6 @@ struct SCALL_SYSCALL_INFO {
 struct SCALL_DETAIL {
     unsigned long long sequence;
     unsigned short length;
-    unsigned short kind;
+    unsigned short reserved;
     char text[160];
 };

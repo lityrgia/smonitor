@@ -24,7 +24,7 @@ pub enum SourceCommand {
 pub enum SourceMessage {
     Status(String),
     Events(Vec<RawEvent>),
-    Details(Vec<(u64, u16, String)>),
+    Details(Vec<(u64, String)>),
     SyscallTable(Vec<(u16, u16, String)>),
     Stats(DriverStats),
 }
@@ -75,6 +75,10 @@ fn run_source(commands: Receiver<SourceCommand>, messages: Sender<SourceMessage>
         target_name_count: 0,
         target_names: [[0; crate::protocol::PROCESS_NAME_BYTES]; crate::protocol::MAX_TARGET_NAMES],
         operation_mask: [u32::MAX; crate::protocol::OPERATION_MASK_WORDS],
+        argument_rule_count: 0,
+        reserved: 0,
+        argument_rules: [crate::protocol::DriverArgumentRule::default();
+            crate::protocol::MAX_ARGUMENT_RULES],
     };
     let mut sequence = 0_u64;
     let mut captured = 0_u64;
@@ -103,7 +107,7 @@ fn run_source(commands: Receiver<SourceCommand>, messages: Sender<SourceMessage>
                 if config.operation_mask[syscall_id / 32] & (1 << (syscall_id % 32)) == 0 {
                     continue;
                 }
-                batch.push(RawEvent {
+                let event = RawEvent {
                     qpc: local_second,
                     pid: if config.target_pid_count == 0 {
                         4242 + n % 3
@@ -126,14 +130,16 @@ fn run_source(commands: Receiver<SourceCommand>, messages: Sender<SourceMessage>
                         name[..8].copy_from_slice(b"demo.exe");
                         name
                     },
-                });
+                };
+                if demo_argument_rules_allow(&config, &event) {
+                    batch.push(event);
+                }
             }
             captured += batch.len() as u64;
             let _ = messages.send(SourceMessage::Events(batch));
             if sequence % 1400 < 350 {
                 let _ = messages.send(SourceMessage::Details(vec![(
                     sequence,
-                    0,
                     "Path=\\Device\\HarddiskVolume3\\demo.txt Access=0x120089".into(),
                 )]));
             }
@@ -147,6 +153,34 @@ fn run_source(commands: Receiver<SourceCommand>, messages: Sender<SourceMessage>
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(not(windows))]
+fn demo_argument_rules_allow(config: &DriverConfig, event: &RawEvent) -> bool {
+    let mut has_only = false;
+    let mut matched_only = false;
+    for rule in config
+        .argument_rules
+        .iter()
+        .take(config.argument_rule_count as usize)
+        .filter(|rule| rule.syscall_id == event.syscall_id)
+    {
+        if rule.action == crate::protocol::ARGUMENT_RULE_ONLY {
+            has_only = true;
+        }
+        let matches = rule
+            .conditions
+            .iter()
+            .take(rule.condition_count as usize)
+            .all(|condition| event.arguments[condition.argument_index as usize] == condition.value);
+        if matches && rule.action == crate::protocol::ARGUMENT_RULE_EXCEPT {
+            return false;
+        }
+        if matches && rule.action == crate::protocol::ARGUMENT_RULE_ONLY {
+            matched_only = true;
+        }
+    }
+    !has_only || matched_only
 }
 
 #[cfg(not(windows))]
@@ -310,7 +344,7 @@ mod windows_source {
                 let count = detail_bytes as usize / size_of::<RawDetail>();
                 let details = detail_buffer[..count]
                     .iter()
-                    .map(|detail| (detail.sequence, detail.kind, detail.text()))
+                    .map(|detail| (detail.sequence, detail.text()))
                     .collect();
                 let _ = messages.send(SourceMessage::Details(details));
             }

@@ -7,7 +7,7 @@ mod source;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use protocol::{
-    CATEGORIES, DriverConfig, DriverStats, MAX_SYSCALLS, MAX_TARGET_NAMES, MAX_TARGET_PIDS,
-    OPERATION_MASK_WORDS, PROCESS_NAME_BYTES, RawEvent, UNKNOWN_RESULT,
+    ARGUMENT_RULE_EXCEPT, ARGUMENT_RULE_ONLY, CATEGORIES, DriverArgumentCondition,
+    DriverArgumentRule, DriverConfig, DriverStats, MAX_ARGUMENT_RULES, MAX_RULE_CONDITIONS,
+    MAX_SYSCALLS, MAX_TARGET_NAMES, MAX_TARGET_PIDS, OPERATION_MASK_WORDS, PROCESS_NAME_BYTES,
+    RawEvent,
 };
 use source::{SourceCommand, SourceHandle, SourceMessage};
 use sysinfo::System;
@@ -71,10 +73,44 @@ enum OperationFilterAction {
     Clear(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgumentRuleKind {
+    Except,
+    Only,
+}
+
+impl ArgumentRuleKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Except => "skip",
+            Self::Only => "only",
+        }
+    }
+
+    fn driver_value(self) -> u8 {
+        match self {
+            Self::Except => ARGUMENT_RULE_EXCEPT,
+            Self::Only => ARGUMENT_RULE_ONLY,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ArgumentCondition {
+    argument_index: usize,
+    value: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ArgumentRule {
+    operation: String,
+    kind: ArgumentRuleKind,
+    conditions: Vec<ArgumentCondition>,
+}
+
 struct EventMenuContext<'a> {
     names: &'a [String],
     details: &'a HashMap<u64, String>,
-    outcomes: &'a HashMap<u64, String>,
     processes: &'a [ProcessRow],
     included_operations: &'a HashSet<String>,
     excluded_operations: &'a HashSet<String>,
@@ -97,7 +133,6 @@ struct MonitorApp {
     visible: Vec<usize>,
     syscall_names: Vec<String>,
     details: HashMap<u64, String>,
-    outcomes: HashMap<u64, String>,
     category_counts: [u64; CATEGORIES.len()],
     stats: DriverStats,
     status: String,
@@ -105,8 +140,10 @@ struct MonitorApp {
     category_mask: u32,
     included_operations: HashSet<String>,
     excluded_operations: HashSet<String>,
+    argument_rules: Vec<ArgumentRule>,
     operation_filter_input: String,
     operation_filter_status: String,
+    filter_config_path: String,
     capture_process_text: String,
     active_capture_pids: Vec<u32>,
     active_capture_names: Vec<String>,
@@ -142,7 +179,6 @@ impl MonitorApp {
             visible: Vec::with_capacity(default_max_events),
             syscall_names: vec![String::new(); MAX_SYSCALLS],
             details: HashMap::new(),
-            outcomes: HashMap::new(),
             category_counts: [0; CATEGORIES.len()],
             stats: DriverStats::default(),
             status: "Connecting…".into(),
@@ -150,8 +186,10 @@ impl MonitorApp {
             category_mask: DEFAULT_CATEGORY_MASK,
             included_operations: HashSet::new(),
             excluded_operations: HashSet::from([DEFAULT_EXCLUDED_OPERATION.to_owned()]),
+            argument_rules: Vec::new(),
             operation_filter_input: String::new(),
             operation_filter_status: String::new(),
+            filter_config_path: "filters.json".into(),
             capture_process_text: String::new(),
             active_capture_pids: Vec::new(),
             active_capture_names: Vec::new(),
@@ -191,6 +229,30 @@ impl MonitorApp {
         {
             *output = encode_kernel_process_name(name);
         }
+        let mut argument_rules = [DriverArgumentRule::default(); MAX_ARGUMENT_RULES];
+        let mut argument_rule_count = 0;
+        for rule in self.argument_rules.iter().take(MAX_ARGUMENT_RULES) {
+            let Some(syscall_id) = self
+                .syscall_names
+                .iter()
+                .position(|name| name == &rule.operation)
+            else {
+                continue;
+            };
+            let mut conditions = [DriverArgumentCondition::default(); MAX_RULE_CONDITIONS];
+            for (output, condition) in conditions.iter_mut().zip(&rule.conditions) {
+                output.argument_index = condition.argument_index as u8;
+                output.value = condition.value;
+            }
+            argument_rules[argument_rule_count] = DriverArgumentRule {
+                syscall_id: syscall_id as u16,
+                action: rule.kind.driver_value(),
+                condition_count: rule.conditions.len().min(MAX_RULE_CONDITIONS) as u8,
+                reserved: 0,
+                conditions,
+            };
+            argument_rule_count += 1;
+        }
         let _ = self
             .source
             .commands
@@ -204,6 +266,9 @@ impl MonitorApp {
                 target_name_count: name_count as u32,
                 target_names,
                 operation_mask: self.operation_mask(),
+                argument_rule_count: argument_rule_count as u32,
+                reserved: 0,
+                argument_rules,
             })));
     }
 
@@ -217,8 +282,7 @@ impl MonitorApp {
             if name.is_empty() {
                 continue;
             }
-            let enabled = !self.excluded_operations.contains(name)
-                && (self.included_operations.is_empty() || self.included_operations.contains(name));
+            let enabled = self.operation_enabled(name);
             if enabled {
                 mask[id / 32] |= 1 << (id % 32);
             } else {
@@ -231,6 +295,13 @@ impl MonitorApp {
     fn operation_enabled(&self, name: &str) -> bool {
         !self.excluded_operations.contains(name)
             && (self.included_operations.is_empty() || self.included_operations.contains(name))
+    }
+
+    fn event_enabled(&self, event: &RawEvent, name: &str) -> bool {
+        if !self.operation_enabled(name) {
+            return false;
+        }
+        argument_rules_allow(&self.argument_rules, event, name)
     }
 
     fn apply_operation_filter(&mut self, action: OperationFilterAction) {
@@ -261,15 +332,10 @@ impl MonitorApp {
                 SourceMessage::Status(status) => self.status = status,
                 SourceMessage::Stats(stats) => self.stats = stats,
                 SourceMessage::Details(details) => {
-                    for (sequence, kind, detail) in details {
-                        if kind == 1 {
-                            self.outcomes.insert(sequence, detail);
-                        } else {
-                            self.details.insert(sequence, detail);
-                        }
+                    for (sequence, detail) in details {
+                        self.details.insert(sequence, detail);
                     }
                     trim_auxiliary_map(&mut self.details, self.max_events);
-                    trim_auxiliary_map(&mut self.outcomes, self.max_events);
                     self.filters_dirty |= !self.search.is_empty();
                 }
                 SourceMessage::SyscallTable(table) => {
@@ -292,7 +358,7 @@ impl MonitorApp {
     fn push_events(&mut self, batch: Vec<RawEvent>) {
         for event in batch {
             let operation = export::name_for(&self.syscall_names, event.syscall_id);
-            if !self.operation_enabled(operation) {
+            if !self.event_enabled(&event, operation) {
                 continue;
             }
             if let Some(count) = self.category_counts.get_mut(event.category as usize) {
@@ -308,8 +374,6 @@ impl MonitorApp {
         }
         if let Some(first) = self.events.first() {
             self.details
-                .retain(|sequence, _| *sequence >= first.sequence);
-            self.outcomes
                 .retain(|sequence, _| *sequence >= first.sequence);
         }
         self.filters_dirty = true;
@@ -331,7 +395,7 @@ impl MonitorApp {
                 continue;
             }
             let name = export::name_for(&self.syscall_names, event.syscall_id);
-            if !self.operation_enabled(name) {
+            if !self.event_enabled(event, name) {
                 continue;
             }
             let process_name = event_process_name(event, &self.processes);
@@ -533,7 +597,6 @@ impl MonitorApp {
         self.events.clear();
         self.visible.clear();
         self.details.clear();
-        self.outcomes.clear();
         self.category_counts = [0; CATEGORIES.len()];
         self.history_evicted = 0;
         self.selected = None;
@@ -555,7 +618,6 @@ impl MonitorApp {
                 self.events.clear();
                 self.visible.clear();
                 self.details.clear();
-                self.outcomes.clear();
                 self.category_counts = [0; CATEGORIES.len()];
                 self.history_evicted = 0;
                 self.selected = None;
@@ -617,6 +679,35 @@ impl MonitorApp {
         true
     }
 
+    fn load_filter_config(&mut self) -> bool {
+        let path = resolve_config_path(self.filter_config_path.trim());
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.operation_filter_status = format!("Cannot read {}: {error}", path.display());
+                return false;
+            }
+        };
+        match parse_filter_config(&text, &self.syscall_names) {
+            Ok(config) => {
+                self.included_operations = config.included_operations;
+                self.excluded_operations = config.excluded_operations;
+                self.argument_rules = config.argument_rules;
+                self.operation_filter_status = format!(
+                    "Loaded {} ({} operation, {} argument rules)",
+                    path.display(),
+                    self.included_operations.len() + self.excluded_operations.len(),
+                    self.argument_rules.len()
+                );
+                true
+            }
+            Err(error) => {
+                self.operation_filter_status = format!("Invalid JSON config: {error}");
+                false
+            }
+        }
+    }
+
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
@@ -632,7 +723,9 @@ impl MonitorApp {
                     changed = true;
                 }
             }
-            let filter_count = self.included_operations.len() + self.excluded_operations.len();
+            let filter_count = self.included_operations.len()
+                + self.excluded_operations.len()
+                + self.argument_rules.len();
             let menu_label = if filter_count == 0 {
                 "...".to_owned()
             } else {
@@ -666,6 +759,20 @@ impl MonitorApp {
                         ui.weak(&self.operation_filter_status);
                     }
                     ui.separator();
+                    ui.strong("JSON configuration");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filter_config_path)
+                                .hint_text("filters.json")
+                                .desired_width(280.0),
+                        )
+                        .on_hover_text("Relative paths are resolved next to smonitor.exe");
+                        if ui.button("Load").clicked() && self.load_filter_config() {
+                            changed = true;
+                        }
+                    });
+                    ui.weak("Rules: skip drops matches; only keeps matches");
+                    ui.separator();
                     let mut rules: Vec<(bool, String)> = self
                         .included_operations
                         .iter()
@@ -679,7 +786,7 @@ impl MonitorApp {
                         )
                         .collect();
                     rules.sort_unstable_by(|left, right| left.1.cmp(&right.1));
-                    if rules.is_empty() {
+                    if rules.is_empty() && self.argument_rules.is_empty() {
                         ui.weak("No operation filters");
                     }
                     egui::ScrollArea::vertical()
@@ -708,9 +815,57 @@ impl MonitorApp {
                                 });
                             }
                         });
-                    if !rules.is_empty() && ui.button("Clear all").clicked() {
+                    let mut remove_argument_rule = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("argument-filter-rules")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (index, rule) in self.argument_rules.iter().enumerate() {
+                                let conditions = rule
+                                    .conditions
+                                    .iter()
+                                    .map(|condition| {
+                                        format!(
+                                            "arg{} == 0x{:X}",
+                                            condition.argument_index + 1,
+                                            condition.value
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" && ");
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [120.0, 18.0],
+                                        egui::Label::new(rule.kind.label()),
+                                    );
+                                    ui.add_sized(
+                                        [210.0, 18.0],
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{}: {conditions}",
+                                                rule.operation
+                                            ))
+                                            .monospace(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(format!("{}: {conditions}", rule.operation));
+                                    if ui.small_button("Remove").clicked() {
+                                        remove_argument_rule = Some(index);
+                                    }
+                                });
+                            }
+                        });
+                    if let Some(index) = remove_argument_rule {
+                        self.argument_rules.remove(index);
+                        changed = true;
+                    }
+                    if (!rules.is_empty() || !self.argument_rules.is_empty())
+                        && ui.button("Clear all").clicked()
+                    {
                         self.included_operations.clear();
                         self.excluded_operations.clear();
+                        self.argument_rules.clear();
                         changed = true;
                     }
                 });
@@ -751,6 +906,7 @@ impl MonitorApp {
                 self.category_mask = DEFAULT_CATEGORY_MASK;
                 self.included_operations.clear();
                 self.excluded_operations = HashSet::from([DEFAULT_EXCLUDED_OPERATION.to_owned()]);
+                self.argument_rules.clear();
                 changed = true;
             }
         });
@@ -767,7 +923,6 @@ impl MonitorApp {
         let events = &self.events;
         let visible = &self.visible;
         let details = &self.details;
-        let outcomes = &self.outcomes;
         let processes = &self.processes;
         let default_process_icon = &self.default_process_icon;
         let included_operations = &self.included_operations;
@@ -844,7 +999,6 @@ impl MonitorApp {
                             &mut EventMenuContext {
                                 names,
                                 details,
-                                outcomes,
                                 processes,
                                 included_operations,
                                 excluded_operations,
@@ -1024,7 +1178,6 @@ impl MonitorApp {
                         self.events.shrink_to(self.max_events);
                         self.visible.shrink_to(self.max_events);
                         self.details.shrink_to(self.max_events);
-                        self.outcomes.shrink_to(self.max_events);
                     }
                     self.filters_dirty = true;
                 }
@@ -1056,7 +1209,7 @@ impl MonitorApp {
                 let operation = export::name_for(&self.syscall_names, event.syscall_id);
                 ui.separator();
                 ui.monospace(format!(
-                    "Selected: seq={} PID={} TID={} syscall=0x{:04X} {} ({}) Arguments={} Result={}",
+                    "Selected: seq={} PID={} TID={} syscall=0x{:04X} {} ({}) Arguments={}",
                     event.sequence,
                     event.pid,
                     event.tid,
@@ -1066,10 +1219,7 @@ impl MonitorApp {
                         .get(event.category as usize)
                         .copied()
                         .unwrap_or("Other"),
-                    argument_text(&self.details, &event, operation),
-                    self.outcomes
-                        .get(&event.sequence)
-                        .map_or(UNKNOWN_RESULT, String::as_str)
+                    argument_text(&self.details, &event, operation)
                 ));
             }
         });
@@ -1091,7 +1241,6 @@ impl MonitorApp {
                 &self.visible,
                 &self.syscall_names,
                 &self.details,
-                &self.outcomes,
                 &process_names,
             ),
             ExportFormat::Jsonl => export::export_jsonl(
@@ -1100,7 +1249,6 @@ impl MonitorApp {
                 &self.visible,
                 &self.syscall_names,
                 &self.details,
-                &self.outcomes,
                 &process_names,
             ),
             ExportFormat::Txt => export::export_txt(
@@ -1109,7 +1257,6 @@ impl MonitorApp {
                 &self.visible,
                 &self.syscall_names,
                 &self.details,
-                &self.outcomes,
                 &process_names,
             ),
         };
@@ -1188,6 +1335,266 @@ fn stat_row(ui: &mut egui::Ui, name: &str, value: u64) {
     ui.label(name);
     ui.monospace(value.to_string());
     ui.end_row();
+}
+
+struct ParsedFilterConfig {
+    included_operations: HashSet<String>,
+    excluded_operations: HashSet<String>,
+    argument_rules: Vec<ArgumentRule>,
+}
+
+fn argument_rules_allow(rules: &[ArgumentRule], event: &RawEvent, operation: &str) -> bool {
+    let mut has_only_rule = false;
+    let mut matched_only_rule = false;
+    for rule in rules.iter().filter(|rule| rule.operation == operation) {
+        if rule.kind == ArgumentRuleKind::Only {
+            has_only_rule = true;
+        }
+        let matches = event.flags & protocol::EVENT_FLAG_ARGUMENTS_VALID != 0
+            && rule
+                .conditions
+                .iter()
+                .all(|condition| event.arguments[condition.argument_index] == condition.value);
+        if matches && rule.kind == ArgumentRuleKind::Except {
+            return false;
+        }
+        if matches && rule.kind == ArgumentRuleKind::Only {
+            matched_only_rule = true;
+        }
+    }
+    !has_only_rule || matched_only_rule
+}
+
+fn resolve_config_path(value: &str) -> PathBuf {
+    let path = PathBuf::from(if value.is_empty() {
+        "filters.json"
+    } else {
+        value
+    });
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join(&path)))
+        .unwrap_or(path)
+}
+
+fn parse_filter_config(text: &str, syscall_names: &[String]) -> Result<ParsedFilterConfig, String> {
+    let root: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| "top level must be a JSON object".to_owned())?;
+    let included_operations =
+        parse_operation_list(object.get("include"), "include", syscall_names)?;
+    let excluded_operations =
+        parse_operation_list(object.get("exclude"), "exclude", syscall_names)?;
+    if let Some(conflict) = included_operations
+        .intersection(&excluded_operations)
+        .next()
+    {
+        return Err(format!("{conflict} is present in both include and exclude"));
+    }
+
+    let mut argument_rules = Vec::new();
+    if let Some(value) = object.get("rules") {
+        let rules = value
+            .as_array()
+            .ok_or_else(|| "rules must be an array".to_owned())?;
+        if rules.len() > MAX_ARGUMENT_RULES {
+            return Err(format!(
+                "rules contains {} entries; maximum is {MAX_ARGUMENT_RULES}",
+                rules.len()
+            ));
+        }
+        for (rule_index, value) in rules.iter().enumerate() {
+            let rule = value
+                .as_object()
+                .ok_or_else(|| format!("rules[{rule_index}] must be an object"))?;
+            argument_rules.push(parse_argument_rule(rule, rule_index, syscall_names)?);
+        }
+    }
+
+    Ok(ParsedFilterConfig {
+        included_operations,
+        excluded_operations,
+        argument_rules,
+    })
+}
+
+fn parse_argument_rule(
+    rule: &serde_json::Map<String, serde_json::Value>,
+    rule_index: usize,
+    syscall_names: &[String],
+) -> Result<ArgumentRule, String> {
+    if let Some(requested_operation) = rule.get("op") {
+        let requested_operation = requested_operation
+            .as_str()
+            .ok_or_else(|| format!("rules[{rule_index}].op must be a string"))?;
+        let operation = canonical_operation(requested_operation, syscall_names)?;
+        let (kind, condition_value) = match (rule.get("skip"), rule.get("only")) {
+            (Some(value), None) => (ArgumentRuleKind::Except, value),
+            (None, Some(value)) => (ArgumentRuleKind::Only, value),
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "rules[{rule_index}] must contain either skip or only, not both"
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "rules[{rule_index}] must contain a skip or only condition object"
+                ));
+            }
+        };
+        let condition_map = condition_value
+            .as_object()
+            .ok_or_else(|| format!("rules[{rule_index}].{} must be an object", kind.label()))?;
+        if condition_map.is_empty() || condition_map.len() > MAX_RULE_CONDITIONS {
+            return Err(format!(
+                "rules[{rule_index}].{} must contain 1 to {MAX_RULE_CONDITIONS} arguments",
+                kind.label()
+            ));
+        }
+        let mut conditions = Vec::with_capacity(condition_map.len());
+        for (argument, value) in condition_map {
+            let argument_index = parse_argument_index(&serde_json::Value::String(argument.clone()))
+                .map_err(|error| format!("rules[{rule_index}].{}: {error}", kind.label()))?;
+            let value = parse_u64_value(value)
+                .map_err(|error| format!("rules[{rule_index}].{argument}: {error}"))?;
+            conditions.push(ArgumentCondition {
+                argument_index,
+                value,
+            });
+        }
+        conditions.sort_unstable_by_key(|condition| condition.argument_index);
+        return Ok(ArgumentRule {
+            operation,
+            kind,
+            conditions,
+        });
+    }
+
+    let requested_operation = rule
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("rules[{rule_index}].op must be a string"))?;
+    let operation = canonical_operation(requested_operation, syscall_names)?;
+    let rule_type = rule
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("rules[{rule_index}].type must be a string"))?;
+    let kind = match rule_type {
+        "arguments_except" => ArgumentRuleKind::Except,
+        "arguments_only" => ArgumentRuleKind::Only,
+        _ => {
+            return Err(format!(
+                "rules[{rule_index}].type must be arguments_except or arguments_only"
+            ));
+        }
+    };
+    let condition_values = rule
+        .get("conditions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("rules[{rule_index}].conditions must be an array"))?;
+    if condition_values.is_empty() || condition_values.len() > MAX_RULE_CONDITIONS {
+        return Err(format!(
+            "rules[{rule_index}].conditions must contain 1 to {MAX_RULE_CONDITIONS} entries"
+        ));
+    }
+    let mut conditions = Vec::with_capacity(condition_values.len());
+    for (condition_index, value) in condition_values.iter().enumerate() {
+        let condition = value.as_object().ok_or_else(|| {
+            format!("rules[{rule_index}].conditions[{condition_index}] must be an object")
+        })?;
+        let argument_index = parse_argument_index(condition.get("argument").ok_or_else(|| {
+            format!("rules[{rule_index}].conditions[{condition_index}].argument is required")
+        })?)
+        .map_err(|error| format!("rules[{rule_index}].conditions[{condition_index}]: {error}"))?;
+        let equals = condition.get("equals").ok_or_else(|| {
+            format!("rules[{rule_index}].conditions[{condition_index}].equals is required")
+        })?;
+        let value = parse_u64_value(equals).map_err(|error| {
+            format!("rules[{rule_index}].conditions[{condition_index}]: {error}")
+        })?;
+        conditions.push(ArgumentCondition {
+            argument_index,
+            value,
+        });
+    }
+    Ok(ArgumentRule {
+        operation,
+        kind,
+        conditions,
+    })
+}
+
+fn parse_operation_list(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    syscall_names: &[String],
+) -> Result<HashSet<String>, String> {
+    let Some(value) = value else {
+        return Ok(HashSet::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array of operation names"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let name = value
+                .as_str()
+                .ok_or_else(|| format!("{field}[{index}] must be a string"))?;
+            canonical_operation(name, syscall_names)
+        })
+        .collect()
+}
+
+fn canonical_operation(name: &str, syscall_names: &[String]) -> Result<String, String> {
+    syscall_names
+        .iter()
+        .find(|known| !known.is_empty() && known.eq_ignore_ascii_case(name.trim()))
+        .cloned()
+        .ok_or_else(|| format!("unknown operation: {name}"))
+}
+
+fn parse_argument_index(value: &serde_json::Value) -> Result<usize, String> {
+    let one_based = if let Some(value) = value.as_u64() {
+        value
+    } else if let Some(value) = value.as_str() {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "first_argument" | "argument1" | "arg1" | "first" => 1,
+            "second_argument" | "argument2" | "arg2" | "second" => 2,
+            "third_argument" | "argument3" | "arg3" | "third" => 3,
+            "fourth_argument" | "argument4" | "arg4" | "fourth" => 4,
+            _ => {
+                return Err("argument must be arg1, arg2, arg3, or arg4".to_owned());
+            }
+        }
+    } else {
+        return Err("argument must be a string or number".to_owned());
+    };
+    if !(1..=MAX_RULE_CONDITIONS as u64).contains(&one_based) {
+        return Err(format!("argument number {one_based} is outside 1..=4"));
+    }
+    Ok(one_based as usize - 1)
+}
+
+fn parse_u64_value(value: &serde_json::Value) -> Result<u64, String> {
+    if let Some(value) = value.as_u64() {
+        return Ok(value);
+    }
+    let Some(text) = value.as_str() else {
+        return Err("equals must be an unsigned JSON number or numeric string".to_owned());
+    };
+    let text = text.trim().replace('_', "");
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("invalid hexadecimal value: {text}"))
+    } else {
+        text.parse::<u64>()
+            .map_err(|_| format!("invalid unsigned value: {text}"))
+    }
 }
 
 fn parse_capture_filters(value: &str) -> (Vec<u32>, Vec<String>) {
@@ -1359,13 +1766,6 @@ fn event_context_menu(ui: &mut egui::Ui, event: RawEvent, context: &mut EventMen
         })
         .wrap(),
     );
-    ui.label("Result");
-    ui.monospace(
-        context
-            .outcomes
-            .get(&event.sequence)
-            .map_or(UNKNOWN_RESULT, String::as_str),
-    );
     ui.separator();
     if ui.button(format!("Include {operation}")).clicked() {
         *context.operation_action = Some(OperationFilterAction::Include(operation.to_owned()));
@@ -1392,12 +1792,8 @@ fn event_context_menu(ui: &mut egui::Ui, event: RawEvent, context: &mut EventMen
         ui.close();
     }
     if ui.button("Copy full event").clicked() {
-        let result = context
-            .outcomes
-            .get(&event.sequence)
-            .map_or(UNKNOWN_RESULT, String::as_str);
         ui.ctx().copy_text(format!(
-            "#{seq} {process} PID={pid} TID={tid} {operation} [{category}] {arguments} => {result}",
+            "#{seq} {process} PID={pid} TID={tid} {operation} [{category}] {arguments}",
             seq = event.sequence,
             pid = event.pid,
             tid = event.tid,
@@ -1442,7 +1838,10 @@ fn install_panic_log() {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_kernel_process_name, parse_capture_filters};
+    use super::{
+        ArgumentRule, ArgumentRuleKind, argument_rules_allow, encode_kernel_process_name,
+        parse_capture_filters, parse_filter_config,
+    };
     use crate::protocol::{EVENT_FLAG_ARGUMENTS_VALID, RawEvent};
 
     #[test]
@@ -1473,5 +1872,104 @@ mod tests {
         assert_eq!(event.display_arguments("NtUnknown"), "unavailable");
         event.flags = EVENT_FLAG_ARGUMENTS_VALID;
         assert_eq!(event.display_arguments("NtUnknown"), "0x0, 0x0, 0x0, 0x0");
+    }
+
+    #[test]
+    fn json_filters_parse_compact_rules() {
+        let names = vec![
+            "NtOpenProcess".to_owned(),
+            "NtDeviceIoControlFile".to_owned(),
+        ];
+        let parsed = parse_filter_config(
+            r#"{
+                "include": [],
+                "exclude": ["ntdeviceiocontrolfile"],
+                "rules": [{
+                    "op": "ntopenprocess",
+                    "skip": {"arg1": "0x100", "arg2": 32}
+                }]
+            }"#,
+            &names,
+        )
+        .unwrap();
+
+        assert!(parsed.excluded_operations.contains("NtDeviceIoControlFile"));
+        assert_eq!(parsed.argument_rules.len(), 1);
+        let rule = &parsed.argument_rules[0];
+        assert_eq!(rule.operation, "NtOpenProcess");
+        assert!(rule.kind == ArgumentRuleKind::Except);
+        assert_eq!(rule.conditions[0].argument_index, 0);
+        assert_eq!(rule.conditions[0].value, 0x100);
+        assert_eq!(rule.conditions[1].argument_index, 1);
+        assert_eq!(rule.conditions[1].value, 32);
+    }
+
+    #[test]
+    fn json_filters_keep_legacy_rule_compatibility() {
+        let parsed = parse_filter_config(
+            r#"{
+                "rules": [{
+                    "operation": "NtOpenProcess",
+                    "type": "arguments_only",
+                    "conditions": [{"argument": "first_argument", "equals": "0x100"}]
+                }]
+            }"#,
+            &["NtOpenProcess".to_owned()],
+        )
+        .unwrap();
+        assert!(parsed.argument_rules[0].kind == ArgumentRuleKind::Only);
+        assert_eq!(parsed.argument_rules[0].conditions[0].argument_index, 0);
+        assert_eq!(parsed.argument_rules[0].conditions[0].value, 0x100);
+    }
+
+    #[test]
+    fn json_filters_reject_unknown_operations() {
+        let error = parse_filter_config(
+            r#"{"include":["NtDefinitelyMissing"]}"#,
+            &["NtOpenProcess".to_owned()],
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("unknown operation"));
+    }
+
+    #[test]
+    fn argument_only_and_except_have_expected_semantics() {
+        let mut event = RawEvent {
+            flags: EVENT_FLAG_ARGUMENTS_VALID,
+            arguments: [0x100, 0x20, 0, 0],
+            ..Default::default()
+        };
+        let only = ArgumentRule {
+            operation: "NtOpenProcess".to_owned(),
+            kind: ArgumentRuleKind::Only,
+            conditions: vec![super::ArgumentCondition {
+                argument_index: 0,
+                value: 0x100,
+            }],
+        };
+        assert!(argument_rules_allow(
+            &[only.clone()],
+            &event,
+            "NtOpenProcess"
+        ));
+        event.arguments[0] = 0x101;
+        assert!(!argument_rules_allow(&[only], &event, "NtOpenProcess"));
+
+        let except = ArgumentRule {
+            operation: "NtOpenProcess".to_owned(),
+            kind: ArgumentRuleKind::Except,
+            conditions: vec![super::ArgumentCondition {
+                argument_index: 1,
+                value: 0x20,
+            }],
+        };
+        assert!(!argument_rules_allow(
+            &[except.clone()],
+            &event,
+            "NtOpenProcess"
+        ));
+        event.arguments[1] = 0x21;
+        assert!(argument_rules_allow(&[except], &event, "NtOpenProcess"));
     }
 }

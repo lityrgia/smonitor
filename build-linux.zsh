@@ -21,6 +21,13 @@ cargo "${cargo_args[@]}" --manifest-path "$root/Cargo.toml"
 mkdir -p "$root/dist"
 cp "$root/driver/outputs/x64/$config/swatcher.sys" "$root/dist/"
 cp "$root/target/x86_64-pc-windows-msvc/$profile/smonitor.exe" "$root/dist/"
+if [[ ! -e "$root/dist/filters.example.json" ]]; then
+    cp "$root/filters.example.json" "$root/dist/"
+fi
+if [[ ! -e "$root/dist/filters.json" ]]; then
+    cp "$root/filters.example.json" "$root/dist/filters.json"
+fi
 
 print "built: $root/dist/swatcher.sys"
 print "built: $root/dist/smonitor.exe"
+print "example: $root/dist/filters.example.json"

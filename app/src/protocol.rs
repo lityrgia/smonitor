@@ -1,11 +1,14 @@
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_SYSCALLS: usize = 0x2000;
 pub const MAX_TARGET_PIDS: usize = 16;
 pub const MAX_TARGET_NAMES: usize = 16;
 pub const PROCESS_NAME_BYTES: usize = 16;
 pub const OPERATION_MASK_WORDS: usize = MAX_SYSCALLS / 32;
-pub const UNKNOWN_RESULT: &str = "unknown";
+pub const MAX_ARGUMENT_RULES: usize = 128;
+pub const MAX_RULE_CONDITIONS: usize = 4;
 pub const EVENT_FLAG_ARGUMENTS_VALID: u32 = 1;
+pub const ARGUMENT_RULE_EXCEPT: u8 = 1;
+pub const ARGUMENT_RULE_ONLY: u8 = 2;
 
 pub const CATEGORIES: [&str; 12] = [
     "File", "Registry", "Process", "Thread", "Memory", "Security", "IPC", "Sync", "System",
@@ -25,6 +28,24 @@ pub struct RawEvent {
     pub sequence: u64,
     pub arguments: [u64; 4],
     pub process_name: [u8; PROCESS_NAME_BYTES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DriverArgumentCondition {
+    pub argument_index: u8,
+    pub reserved: [u8; 7],
+    pub value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DriverArgumentRule {
+    pub syscall_id: u16,
+    pub action: u8,
+    pub condition_count: u8,
+    pub reserved: u32,
+    pub conditions: [DriverArgumentCondition; MAX_RULE_CONDITIONS],
 }
 
 impl RawEvent {
@@ -124,6 +145,9 @@ pub struct DriverConfig {
     pub target_name_count: u32,
     pub target_names: [[u8; PROCESS_NAME_BYTES]; MAX_TARGET_NAMES],
     pub operation_mask: [u32; OPERATION_MASK_WORDS],
+    pub argument_rule_count: u32,
+    pub reserved: u32,
+    pub argument_rules: [DriverArgumentRule; MAX_ARGUMENT_RULES],
 }
 
 #[repr(C)]
@@ -155,7 +179,7 @@ pub struct RawSyscallInfo {
 pub struct RawDetail {
     pub sequence: u64,
     pub length: u16,
-    pub kind: u16,
+    pub reserved: u16,
     pub text: [u8; 160],
 }
 
@@ -180,7 +204,9 @@ impl RawSyscallInfo {
 }
 
 const _: () = assert!(size_of::<RawEvent>() == 80);
-const _: () = assert!(size_of::<DriverConfig>() == 1368);
+const _: () = assert!(size_of::<DriverArgumentCondition>() == 16);
+const _: () = assert!(size_of::<DriverArgumentRule>() == 72);
+const _: () = assert!(size_of::<DriverConfig>() == 10592);
 const _: () = assert!(size_of::<DriverStats>() == 56);
 #[cfg(windows)]
 const _: () = assert!(size_of::<RawDetail>() == 176);

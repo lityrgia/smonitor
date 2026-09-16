@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::protocol::{CATEGORIES, RawEvent, UNKNOWN_RESULT};
+use crate::protocol::{CATEGORIES, RawEvent};
 
 pub fn export_csv(
     path: &Path,
@@ -11,19 +11,18 @@ pub fn export_csv(
     visible: &[usize],
     names: &[String],
     details: &HashMap<u64, String>,
-    outcomes: &HashMap<u64, String>,
     process_names: &HashMap<u32, String>,
 ) -> std::io::Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
     writeln!(
         out,
-        "pid,process,tid,syscall_id,category,operation,arguments,result"
+        "pid,process,tid,syscall_id,category,operation,arguments"
     )?;
     for &index in visible {
-        let row = export_row(events[index], names, details, outcomes, process_names);
+        let row = export_row(events[index], names, details, process_names);
         writeln!(
             out,
-            "{},\"{}\",{},0x{:04X},{},\"{}\",\"{}\",\"{}\"",
+            "{},\"{}\",{},0x{:04X},{},\"{}\",\"{}\"",
             row.event.pid,
             csv_escape(&row.process),
             row.event.tid,
@@ -31,7 +30,6 @@ pub fn export_csv(
             category_name(row.event.category),
             csv_escape(row.operation),
             csv_escape(&row.arguments),
-            csv_escape(row.result),
         )?;
     }
     Ok(())
@@ -43,15 +41,14 @@ pub fn export_jsonl(
     visible: &[usize],
     names: &[String],
     details: &HashMap<u64, String>,
-    outcomes: &HashMap<u64, String>,
     process_names: &HashMap<u32, String>,
 ) -> std::io::Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
     for &index in visible {
-        let row = export_row(events[index], names, details, outcomes, process_names);
+        let row = export_row(events[index], names, details, process_names);
         writeln!(
             out,
-            "{{\"pid\":{},\"process\":\"{}\",\"tid\":{},\"syscall_id\":{},\"category\":\"{}\",\"operation\":\"{}\",\"arguments\":\"{}\",\"result\":\"{}\"}}",
+            "{{\"pid\":{},\"process\":\"{}\",\"tid\":{},\"syscall_id\":{},\"category\":\"{}\",\"operation\":\"{}\",\"arguments\":\"{}\"}}",
             row.event.pid,
             json_escape(&row.process),
             row.event.tid,
@@ -59,7 +56,6 @@ pub fn export_jsonl(
             json_escape(category_name(row.event.category)),
             json_escape(row.operation),
             json_escape(&row.arguments),
-            json_escape(row.result),
         )?;
     }
     Ok(())
@@ -71,22 +67,20 @@ pub fn export_txt(
     visible: &[usize],
     names: &[String],
     details: &HashMap<u64, String>,
-    outcomes: &HashMap<u64, String>,
     process_names: &HashMap<u32, String>,
 ) -> std::io::Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
     for &index in visible {
-        let row = export_row(events[index], names, details, outcomes, process_names);
+        let row = export_row(events[index], names, details, process_names);
         writeln!(
             out,
-            "{} ({}) TID={} {} [{}] {} => {}",
+            "{} ({}) TID={} {} [{}] {}",
             row.process,
             row.event.pid,
             row.event.tid,
             row.operation,
             category_name(row.event.category),
             row.arguments,
-            row.result,
         )?;
     }
     Ok(())
@@ -119,14 +113,12 @@ struct ExportRow<'a> {
     process: String,
     operation: &'a str,
     arguments: String,
-    result: &'a str,
 }
 
 fn export_row<'a>(
     event: RawEvent,
     names: &'a [String],
     details: &'a HashMap<u64, String>,
-    outcomes: &'a HashMap<u64, String>,
     process_names: &'a HashMap<u32, String>,
 ) -> ExportRow<'a> {
     let operation = name_for(names, event.syscall_id);
@@ -135,15 +127,11 @@ fn export_row<'a>(
         .get(&event.sequence)
         .cloned()
         .unwrap_or_else(|| event.display_arguments(operation));
-    let result = outcomes
-        .get(&event.sequence)
-        .map_or(UNKNOWN_RESULT, String::as_str);
     ExportRow {
         event,
         process,
         operation,
         arguments,
-        result,
     }
 }
 
