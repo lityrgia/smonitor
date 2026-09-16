@@ -737,13 +737,13 @@ impl MonitorApp {
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
                 )
                 .ui(ui, |ui| {
-                    ui.set_min_width(390.0);
+                    ui.set_min_width(760.0);
                     ui.strong("Operation filters");
                     ui.horizontal(|ui| {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.operation_filter_input)
                                 .hint_text("NtOpenProcess")
-                                .desired_width(210.0),
+                                .desired_width(560.0),
                         );
                         if response.changed() {
                             self.operation_filter_status.clear();
@@ -764,7 +764,7 @@ impl MonitorApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.filter_config_path)
                                 .hint_text("filters.json")
-                                .desired_width(280.0),
+                                .desired_width(650.0),
                         )
                         .on_hover_text("Relative paths are resolved next to smonitor.exe");
                         if ui.button("Load").clicked() && self.load_filter_config() {
@@ -803,7 +803,7 @@ impl MonitorApp {
                                         }),
                                     );
                                     ui.add_sized(
-                                        [210.0, 18.0],
+                                        [560.0, 18.0],
                                         egui::Label::new(RichText::new(name).monospace())
                                             .truncate(),
                                     );
@@ -834,12 +834,9 @@ impl MonitorApp {
                                     .collect::<Vec<_>>()
                                     .join(" && ");
                                 ui.horizontal(|ui| {
+                                    ui.add_sized([80.0, 18.0], egui::Label::new(rule.kind.label()));
                                     ui.add_sized(
-                                        [120.0, 18.0],
-                                        egui::Label::new(rule.kind.label()),
-                                    );
-                                    ui.add_sized(
-                                        [210.0, 18.0],
+                                        [560.0, 18.0],
                                         egui::Label::new(
                                             RichText::new(format!(
                                                 "{}: {conditions}",
