@@ -76,26 +76,8 @@ Administrator.
 
 ### JSON filters
 
-Open the **...** operation menu, enter a JSON file name, and press **Load**. Relative paths are
-resolved next to `smonitor.exe`. Builds create a starter `filters.json` without overwriting an
-existing file; the original template is also included as `filters.example.json`:
-
-```json
-{
-  "include": [],
-  "exclude": ["NtDeviceIoControlFile"],
-  "rules": [
-    {
-      "op": "NtOpenProcess",
-      "skip": { "arg1": "0x100" }
-    },
-    {
-      "op": "NtWriteVirtualMemory",
-      "only": { "arg1": "0x40", "arg4": 4096 }
-    }
-  ]
-}
-```
+Open the **...** operation menu, enter a JSON file name, and press **Load**.
+The original template is also included as `filters.example.json`:
 
 `skip` drops the call when all listed arguments match. `only` does the opposite: for that operation,
 only calls matching at least one `only` rule are retained. Conditions inside one rule use AND;
